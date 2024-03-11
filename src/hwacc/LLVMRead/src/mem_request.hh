@@ -43,6 +43,10 @@ class MemoryRequest {
     uint8_t * getBuffer() { return buffer; }
     Addr getAddress() { return address; }
     std::string printBuffer();
+    void setPacket(PacketPtr _pkt) { pkt = _pkt; }
+    PacketPtr getPacket() { return pkt; }
+    size_t getLength() { return length; }
+    size_t getTotalLength() { return totalLength; }
 };
 
 #endif //__MEM_REQUEST_HH__

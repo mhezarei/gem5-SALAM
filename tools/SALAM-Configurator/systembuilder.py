@@ -281,7 +281,7 @@ def main():
     else:
         file_name = args.sys_name
     config_path = M5_Path + "/configs/SALAM/"
-    working_dir = M5_Path + "/" + args.bench_path + "/"
+    working_dir = args.bench_path + "/"
     main_yml_path = working_dir + args.config_name
 
     # Set base addresses
@@ -318,8 +318,12 @@ def main():
                     config_path + "fs_" + file_name + ".py")
     f = open(config_path + "fs_" + file_name + ".py", "r")
     fullSystem = f.readlines()
-    fullSystem[65] = "import " + file_name
-    fullSystem[229] = "        " + file_name + ".makeHWAcc(args, test_sys)\n"
+
+    # smarter way of doing this
+    # fullSystem[65] = "import " + file_name
+    # fullSystem[229] = "        " + file_name + ".makeHWAcc(args, test_sys)\n"
+    fullSystem = [line.replace("TEMPLATE", file_name) for line in fullSystem]
+
     f = open(config_path + "fs_" + file_name + ".py", "w")
     f.writelines(fullSystem)
     # Warn if the size is greater than allowed

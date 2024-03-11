@@ -262,7 +262,8 @@ class AccCluster:
             "	system.iobus.mem_side_ports = clstr.local_bus.cpu_side_ports")
         # Need to define l2coherency in the YAML file?
         lines.append(
-            "	clstr._connect_caches(system, options, l2coherent=False)")
+            "	clstr._connect_caches(system, options, l2coherent=True, cache_size='2MiB')")
+        lines.append("	clstr.cluster_cache.assoc = 16")
         lines.append("	gic = system.realview.gic")
         lines.append("")
 
@@ -315,10 +316,10 @@ class Accelerator:
 
         # Add interrupt number if it exists
         if self.int_num is not None:
-            lines.append("clstr." + self.name + " = CommInterface(devicename=acc, gic=gic, pio_addr="
+            lines.append("clstr." + self.name + " = CommInterface(devicename=acc, clock_period=1, gic=gic, pio_addr="
                          + str(hex(self.address)) + ", pio_size=" + str(self.size) + ", int_num=" + str(self.int_num) + ")")
         else:
-            lines.append("clstr." + self.name + " = CommInterface(devicename=acc, gic=gic, pio_addr="
+            lines.append("clstr." + self.name + " = CommInterface(devicename=acc, clock_period=1, gic=gic, pio_addr="
                          + str(hex(self.address)) + ", pio_size=" + str(self.size) + ")")
 
         lines.append("AccConfig(clstr." + self.name + ", ir, hw_config)")
@@ -348,6 +349,8 @@ class Accelerator:
                 assert False, "Shouldn't be here?"
                 # lines.append("clstr." + self.name + ".pio " +
                 #              "=" " clstr." + i + ".local")
+        # Assign ACP
+        lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
         # Add StreamIn
         for inCon in self.stream_in:
             lines.append("clstr." + self.name +
@@ -553,8 +556,10 @@ class Variable:
                          + ", stream_size = " + str(self.streamSize) + ", buffer_size = " + str(self.bufferSize) + ")")
             lines.append("clstr." + self.inCon + ".stream = " +
                          "clstr." + self.name.lower() + ".stream_in")
+            lines.append("clstr." + self.inCon + ".stream = " + "clstr." + self.name.lower() + ".status_in")
             lines.append("clstr." + self.outCon + ".stream = " +
                          "clstr." + self.name.lower() + ".stream_out")
+            lines.append("clstr." + self.outCon + ".stream = " + "clstr." + self.name.lower() + ".status_out")
             lines.append("")
         # Scratchpad Memory
         elif self.type == 'SPM':

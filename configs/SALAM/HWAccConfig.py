@@ -14,7 +14,8 @@ def AccConfig(acc, bench_file, config_file):
     # Benchmark path
     acc.llvm_interface.in_file = bench_file
     M5_Path = os.getenv('M5_PATH')
-    benchname = os.path.splitext(os.path.basename(bench_file))[0]
+    # benchname = os.path.splitext(os.path.basename(bench_file))[0]
+    benchname = acc.devicename
 
     # lenet config launcher custom stuff
     benchPath = Path(bench_file).parts
@@ -24,6 +25,7 @@ def AccConfig(acc, bench_file, config_file):
     # acc.llvm_interface.sched_threshold = ConfigSectionMap("Scheduler")['sched_threshold']
     # acc.llvm_interface.clock_period = ConfigSectionMap("AccConfig")['clock_period']
     # acc.llvm_interface.lockstep_mode = Config.getboolean("Scheduler", 'lockstep_mode')
+    acc.llvm_interface.clock_period = acc.clock_period
 
     # TODO: Auto generate the functional unit list
 
@@ -33,7 +35,7 @@ def AccConfig(acc, bench_file, config_file):
     acc.hw_interface.cycle_counts = CycleCounts()
     # acc.hw_interface.cycle_counts
 
-    if benchPath[m5PathLen+1] == 'mobilenetv2':
+    if 'mobilenetv2' in benchPath:
         fu_yaml = open(config_file, 'r')
         for yaml_inst_list in yaml.safe_load_all(fu_yaml):
             document = yaml_inst_list['hw_config']

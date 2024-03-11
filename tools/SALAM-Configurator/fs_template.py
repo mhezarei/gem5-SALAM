@@ -139,6 +139,13 @@ def build_test_system(np):
     elif args.kernel is not None:
         test_sys.workload.object_file = binary(args.kernel)
 
+        load = "_1000"
+        ii_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"ii{load}.bin"
+        abp_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"abp{load}.bin"
+        ii_size = os.path.getsize(ii_path)
+        test_sys.workload.extras = [ii_path, abp_path]
+        test_sys.workload.extras_addrs = [0x80c00000, 0x80c00000 + ii_size]
+
     if args.script is not None:
         test_sys.readfile = args.script
 

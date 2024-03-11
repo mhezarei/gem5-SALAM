@@ -28,6 +28,9 @@ if env['TARGET_ISA'] == 'arm':
     SimObject('SALAMPowerModel.py')
     SimObject('SimulatorConfig.py')
 
+    #Custom Objects
+    SimObject("WindowManager.py")
+
     #Functional Units
     #SimObject('Adder.py')
 
@@ -43,6 +46,7 @@ if env['TARGET_ISA'] == 'arm':
     Source('stream_port.cc')
     Source('scratchpad_memory.cc')
     Source('register_bank.cc')
+    Source('window_manager.cc')
     
     #
     Source('LLVMRead/src/value.cc')
@@ -84,6 +88,7 @@ if env['TARGET_ISA'] == 'arm':
     DebugFlag('StreamDma')
     DebugFlag('Trace')
     DebugFlag('Step')
+    DebugFlag('WindowManager')
 
     #
     CompoundFlag('JDEV', ['LLVMInterface','CommInterface', 'Runtime', 'RuntimeCompute', 'RuntimeQueues', 'SALAM_Debug'])
