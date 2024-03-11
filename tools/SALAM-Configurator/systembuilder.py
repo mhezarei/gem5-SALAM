@@ -112,31 +112,36 @@ def parse_yaml(
         cluster_name = None
         dmas = []
         accs = []
-        for list_type, devices in cluster_dict.items():
-            if list_type == "acc_cluster":
-                for device in devices:
-                    if "Name" in device:
-                        cluster_name = device["Name"]
-                    if "DMA" in device:
-                        dmas.append(device)
-                    if "Accelerator" in device:
-                        accs.append(device)
+        window_managers = []
+        print(cluster_dict["acc_cluster"], len(cluster_dict["acc_cluster"]))
+        for device in cluster_dict["acc_cluster"]:
+            if "Name" in device:
+                cluster_name = device["Name"]
+            if "DMA" in device:
+                dmas.append(device)
+            if "Accelerator" in device:
+                accs.append(device)
+            if "WindowManager" in device:
+                window_managers.append(device)
+
         if not cluster_name:
             continue
+
         clusters.append(
             config_parser.AccCluster(
                 name=cluster_name,
                 dmas=dmas,
                 accs=accs,
+                window_managers=window_managers,
                 base_address=base_address,
                 working_dir=working_dir,
                 config_path=parent_path,
                 hw_config_path=hw_path,
             )
         )
-        base_address = clusters[-1].top_address + (
-            64 - (int(clusters[-1].top_address) % 64)
-        )
+
+        top_addr = clusters[-1].top_address
+        base_address = top_addr + (64 - (int(top_addr) % 64))
         if (int(base_address) % 64) != 0:
             print("Address Alignment Error: " + hex(base_address))
 
@@ -158,14 +163,20 @@ def gen_config(clusters, config_path: str, file_name: str):
         for cluster in clusters:
             for line in cluster.genConfig():
                 writer.write(line + "\n")
+
             # Add cluster definitions here
             for dma in cluster.dmas:
                 writeLines(writer, dma.genConfig())
+
             # Come back here later and see if you can get away with doing these at the same time (probably not)
             for acc in cluster.accs:
                 writeLines(writer, acc.genDefinition())
             for acc in cluster.accs:
                 writeLines(writer, acc.genConfig())
+
+            for wm in cluster.window_managers:
+                writeLines(writer, wm.genDefinition())
+                writeLines(writer, wm.genConfig())
 
         # Write cluster creation
         writer.write("def makeHWAcc(args, system):\n\n")
@@ -345,6 +356,13 @@ def gen_header(header_list, clusters, working_dir: str):
                             current_header.append(
                                 "#define " + var.name + " " + hex(var.address) + "\n"
                             )
+
+                for wm in cluster.window_managers:
+                    current_header.append("//WindowManager: " + wm.name.upper() + "\n")
+                    current_header.append(
+                        "#define " + wm.name.upper() + " " + hex(wm.pio_address) + "\n"
+                    )
+
                 current_header.append("//END GENERATED CODE")
                 f.writelines(current_header)
                 current_header = []
