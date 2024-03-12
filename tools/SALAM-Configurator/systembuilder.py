@@ -171,11 +171,12 @@ def gen_config(clusters, config_path: str, file_name: str):
             # Come back here later and see if you can get away with doing these at the same time (probably not)
             for acc in cluster.accs:
                 writeLines(writer, acc.genDefinition())
-            for acc in cluster.accs:
-                writeLines(writer, acc.genConfig())
-
             for wm in cluster.window_managers:
                 writeLines(writer, wm.genDefinition())
+
+            for acc in cluster.accs:
+                writeLines(writer, acc.genConfig())
+            for wm in cluster.window_managers:
                 writeLines(writer, wm.genConfig())
 
         # Write cluster creation
