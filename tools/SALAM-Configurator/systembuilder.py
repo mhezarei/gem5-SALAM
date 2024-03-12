@@ -360,7 +360,7 @@ def gen_header(header_list, clusters, working_dir: str):
                 for wm in cluster.window_managers:
                     current_header.append("//WindowManager: " + wm.name.upper() + "\n")
                     current_header.append(
-                        "#define " + wm.name.upper() + " " + hex(wm.pio_address) + "\n"
+                        "#define " + wm.name.upper() + " " + hex(wm.pio_addr) + "\n"
                     )
 
                 current_header.append("//END GENERATED CODE")
