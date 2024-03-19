@@ -23,8 +23,9 @@ class WindowManager(BasicPioDevice):
     pe_stream_ports = VectorRequestPort(
         "Request ports connected to processing element queues"
     )
-    local = VectorRequestPort(
-        "Request ports connected to local cluster xbar (for memory accesses)"
+    local = VectorRequestPort("Request ports connected to local cluster xbar")
+    acp = VectorRequestPort(
+        "Request ports connected to coherency xbar (for memory accesses)"
     )
 
     # latencies

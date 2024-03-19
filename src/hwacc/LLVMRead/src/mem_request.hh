@@ -47,6 +47,7 @@ class MemoryRequest {
     PacketPtr getPacket() { return pkt; }
     size_t getLength() { return length; }
     size_t getTotalLength() { return totalLength; }
+    size_t getBeginAddr() { return beginAddr; }
 };
 
 #endif //__MEM_REQUEST_HH__

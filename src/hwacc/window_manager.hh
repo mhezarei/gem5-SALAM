@@ -10,34 +10,42 @@
 #include <queue>
 #include <vector>
 
+#define NEXT_TICK nextCycle()
+
 class WindowManager : public BasicPioDevice {
 public:
   bool debug() const { return debugEnabled; }
 
 private:
+  // TODO: change sourceID to real address
   struct PERequest {
     uint8_t sourceID;
     uint16_t startElement;
-    uint8_t Length;
+    uint8_t length;
   };
+  typedef uint64_t Offset;
 
   class SPMPort : public ScratchpadRequestPort {
     friend class WindowManager;
 
   private:
     WindowManager *owner;
+    std::queue<PacketPtr> retryPackets;
+    MemoryRequest *activeReadRequest, *activeWriteRequest;
 
   public:
     SPMPort(const std::string &name, WindowManager *owner,
             PortID id = InvalidPortID)
         : ScratchpadRequestPort(name, owner, id), owner(owner) {}
 
-  private:
-    std::queue<PacketPtr> retryPackets;
-
   protected:
     void addRetryPacket(PacketPtr pkt) { retryPackets.push(pkt); }
     bool hasRetryPackets() { return !retryPackets.empty(); }
+    void setActiveReadRequest(MemoryRequest *req) { activeReadRequest = req; }
+    void setActiveWriteRequest(MemoryRequest *req) { activeWriteRequest = req; }
+    bool isReading() { return activeReadRequest == nullptr; }
+    bool isWriting() { return activeWriteRequest == nullptr; }
+    bool isActive() { return !isReading() && !isWriting(); }
 
     virtual bool recvTimingResp(PacketPtr pkt);
     virtual void recvReqRetry();
@@ -48,6 +56,7 @@ private:
 
   class GenericRequestPort : public StreamRequestPort {
     friend class WindowManager;
+    friend class Window;
 
   protected:
     WindowManager *owner;
@@ -70,7 +79,7 @@ private:
     bool debug() { return owner->debug(); }
   };
 
-  class PEPort : private GenericRequestPort {
+  class PEPort : public GenericRequestPort {
     friend class WindowManager;
 
   public:
@@ -83,13 +92,42 @@ private:
     Addr getStartAddress() { return (*getAddrRanges().begin()).start(); }
   };
 
-  class LocalPort : private GenericRequestPort {
+  class LocalPort : public GenericRequestPort {
     friend class WindowManager;
 
   public:
     LocalPort(const std::string &name, WindowManager *owner,
               PortID id = InvalidPortID)
         : GenericRequestPort(name, owner, id) {}
+  };
+
+  class GlobalPort : public GenericRequestPort {
+    friend class WindowManager;
+
+  public:
+    GlobalPort(const std::string &name, WindowManager *owner,
+               PortID id = InvalidPortID)
+        : GenericRequestPort(name, owner, id) {}
+  };
+
+  class Window {
+    friend class WindowManager;
+
+  private:
+    WindowManager *owner;
+    Addr baseMemoryAddress;
+    std::queue<MemoryRequest *> memoryRequests;
+    std::vector<MemoryRequest *> sentMemoryRequests;
+
+    Addr spmBaseAddr;
+    Offset currentSPMOffset;
+
+  public:
+    Window(WindowManager *owner, Addr base_memory_addr,
+           const std::vector<Offset> &offsets, Addr base_spm_addr);
+    bool debug() { return owner->debug(); }
+    bool sendMemoryRequest();
+    void sendSPMRequest(SPMPort *spm_port, uint64_t data);
   };
 
   class TickEvent : public Event {
@@ -110,7 +148,6 @@ private:
   std::string deviceName;
   bool debugEnabled;
   int processingDelay, clockPeriod;
-  Tick nextTick;
   RequestorID masterId;
   Addr io_size;
   Addr io_addr;
@@ -118,30 +155,47 @@ private:
   ByteOrder endian;
 
   // Class variables
-  size_t peRequestLength;
+  size_t requestLength;
+
+  // SPM related info
+  Addr currentFreeSPMAddress;
+  size_t spmSize;
 
   // Ports
   std::vector<SPMPort *> spmPorts;
   std::vector<LocalPort *> localPorts;
+  std::vector<GlobalPort *> globalPorts;
   std::vector<PEPort *> peStreamPorts;
 
   // Necessary data structures
-  std::map<std::string, std::vector<PERequest>> peRequestMapper;
   std::vector<MemoryRequest *> activeReadRequests;
+  std::vector<MemoryRequest *> activeWriteRequests;
+  std::queue<Window *> ongoingWindows;
+  // TODO: this will be replaced with actual address communication
+  std::map<uint8_t, Addr> sourceIDToAddr;
+  std::queue<std::pair<Window *, uint64_t>> spmRetryPackets;
+  std::vector<std::pair<MemoryRequest *, Window *>> activeWindowMemoryRequests;
 
+  void handlePERequest(MemoryRequest *read_req);
+  void handleWindowMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
+  void scheduleEvent(Tick when = 0);
   void recvPacket(PacketPtr pkt);
   bool checkPort(RequestPort *port, size_t len, bool isRead);
   void readFromPort(RequestPort *port, Addr addr, size_t len);
   MemoryRequest *findMemRequest(PacketPtr pkt,
                                 const std::vector<MemoryRequest *> &targetVec);
-  void removeMemRequest(MemoryRequest *memReq,
+  void removeMemRequest(MemoryRequest *mem_req,
                         std::vector<MemoryRequest *> &targetVec);
-  PERequest constructPERequestFromReadRequest(MemoryRequest *readReq);
+  PERequest constructPERequestFromReadRequest(MemoryRequest *read_req);
+  GlobalPort *getValidGlobalPort(Addr add, bool read);
+  SPMPort *findAvailableSPMPort();
+  Window *findCorrespondingWindow(PacketPtr pkt);
+  void removeActiveWindowRequest(MemoryRequest *mem_req);
 
 public:
   WindowManager(const WindowManagerParams &p);
-  virtual Tick read(PacketPtr pkt);
-  virtual Tick write(PacketPtr pkt);
+  virtual Tick read(PacketPtr pkt) override;
+  virtual Tick write(PacketPtr pkt) override;
   Port &getPort(const std::string &if_name,
                 PortID idx = InvalidPortID) override;
 };
