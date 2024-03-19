@@ -350,7 +350,7 @@ Port &WindowManager::getPort(const std::string &if_name, PortID idx) {
       const std::string portName = name() + csprintf(".acp[%d]", idx);
       globalPorts[idx] = new GlobalPort(portName, this, idx);
     }
-    return *localPorts[idx];
+    return *globalPorts[idx];
   } else if (if_name == "spm") {
     if (idx >= spmPorts.size())
       spmPorts.resize((idx + 1));
