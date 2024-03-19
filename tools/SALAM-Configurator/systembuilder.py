@@ -113,7 +113,6 @@ def parse_yaml(
         dmas = []
         accs = []
         window_managers = []
-        print(cluster_dict["acc_cluster"], len(cluster_dict["acc_cluster"]))
         for device in cluster_dict["acc_cluster"]:
             if "Name" in device:
                 cluster_name = device["Name"]
@@ -363,6 +362,10 @@ def gen_header(header_list, clusters, working_dir: str):
                     current_header.append(
                         "#define " + wm.name.upper() + " " + hex(wm.pio_addr) + "\n"
                     )
+                    for var in wm.variables:
+                        current_header.append(
+                            "#define " + var.name + " " + hex(var.address) + "\n"
+                        )
 
                 current_header.append("//END GENERATED CODE")
                 f.writelines(current_header)

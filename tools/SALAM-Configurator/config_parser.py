@@ -4,6 +4,7 @@ class AccCluster:
         name: str,
         dmas,
         accs,
+        window_managers,
         base_address: int,
         working_dir: str,
         config_path: str,
@@ -12,6 +13,7 @@ class AccCluster:
         self.name = name
         self.dmas = dmas
         self.accs = accs
+        self.window_managers = window_managers
         self.base_address = base_address
         self.top_address = base_address
         self.config_path = config_path
@@ -23,6 +25,7 @@ class AccCluster:
     def process_config(self, working_dir):
         dma_class = []
         acc_class = []
+        window_manager_class = []
         top_address = self.base_address
 
         # Parse DMAs
@@ -60,7 +63,7 @@ class AccCluster:
                             )
                         )
                     aligned_inc = int(pio_size) + (64 - (int(pio_size) % 64))
-                    top_address = top_address + aligned_inc
+                    top_address += aligned_inc
                 elif "Stream" in device_dict["Type"]:
                     pio_size = 32
                     statusSize = 4
@@ -133,7 +136,64 @@ class AccCluster:
                         )
 
                     # Increment Top Address
-                    top_address = top_address + aligned_inc + alignedStatusInc
+                    top_address += aligned_inc + alignedStatusInc
+
+        # Parse Window Managers
+        for wm in self.window_managers:
+            name = None
+            pio_addr = None
+            pio_size = None
+            master = None
+            debug = False
+            variables = []
+
+            # Find the name first...
+            # Also, find a non-stupid way to find the name first
+            for device_dict in wm["WindowManager"]:
+                if "Name" in device_dict:
+                    name = device_dict["Name"]
+            # Parse the rest of the parameters
+            for device_dict in wm["WindowManager"]:
+                if "PIOSize" in device_dict:
+                    pio_addr = top_address
+                    size = device_dict["PIOSize"]
+                    pio_size = size + (64 - (size % 64))
+                    top_address += pio_size
+                if "PIOMaster" in device_dict:
+                    master = device_dict["PIOMaster"]
+                if "Debug" in device_dict:
+                    debug = device_dict["Debug"]
+                if "Var" in device_dict:
+                    for var in device_dict["Var"]:
+                        # Setup the variable's parameters to pass
+                        varParams = dict(var)
+                        varParams["Address"] = top_address
+                        varParams["AccName"] = name
+
+                        # Create and append a new variable
+                        variables.append(Variable(**varParams))
+                        # Increment the current address based on size
+                        if "SPM" in var["Type"]:
+                            aligned_inc = int(var["Size"]) + (
+                                64 - (int(var["Size"]) % 64)
+                            )
+                            top_address += aligned_inc
+                        else:
+                            # Should never get here... but just in case throw an exception
+                            exceptionString = f"The Variable: {name} has an invalid type named: {var['Type']}"
+                            raise Exception(exceptionString)
+            # Append accelerator to the cluster
+            window_manager_class.append(
+                WindowManager(
+                    name=name,
+                    pio_addr=pio_addr,
+                    pio_size=pio_size,
+                    master=master,
+                    variables=variables,
+                    debug=debug,
+                )
+            )
+
         # Parse Accelerators
         for acc in self.accs:
             name = None
@@ -161,7 +221,7 @@ class AccCluster:
                     pio_size = device_dict["PIOSize"] + (
                         64 - (device_dict["PIOSize"] % 64)
                     )
-                    top_address = top_address + pio_size
+                    top_address += pio_size
                     if ((top_address + pio_size) % 64) != 0:
                         print("Acc Error: " + hex(pio_address))
                 if "IrPath" in device_dict:
@@ -201,19 +261,19 @@ class AccCluster:
                             aligned_inc = int(var["Size"]) + (
                                 64 - (int(var["Size"]) % 64)
                             )
-                            top_address = top_address + aligned_inc
+                            top_address += aligned_inc
                         elif "Stream" in var["Type"]:
                             statusSize = 4
                             aligned_inc = int(var["StreamSize"] + 4) + (
                                 64 - (int(var["StreamSize"] + 4) % 64)
                             )
                             status_inc = int(statusSize) + (64 - (int(statusSize) % 64))
-                            top_address = top_address + aligned_inc + status_inc
+                            top_address += aligned_inc + status_inc
                         elif "RegisterBank" in var["Type"]:
                             aligned_inc = int(var["Size"]) + (
                                 64 - (int(var["Size"]) % 64)
                             )
-                            top_address = top_address + aligned_inc
+                            top_address += aligned_inc
                         elif "Cache" in var["Type"]:
                             # Don't need to change anything for cache
                             top_address = top_address
@@ -248,6 +308,7 @@ class AccCluster:
 
         self.accs = acc_class
         self.dmas = dma_class
+        self.window_managers = window_manager_class
         self.top_address = top_address
 
     def genConfig(self):
@@ -273,8 +334,50 @@ class AccCluster:
         return lines
 
 
-class Accelerator:
+class WindowManager:
+    def __init__(self, name, pio_addr, pio_size, master, variables, debug: bool):
+        self.name = name.lower()
+        self.pio_addr = pio_addr
+        self.pio_size = pio_size
+        self.master = master
+        self.variables = variables
+        self.debug = debug
 
+    def genDefinition(self):
+        lines = []
+        lines.append("# " + self.name + " Definition")
+        lines.append("wm_name = " + '"' + self.name + '"')
+        lines.append(
+            f"clstr.{self.name} = WindowManager(devicename=wm_name, pio_addr={str(hex(self.pio_addr))}, pio_size={self.pio_size}, clock_period=1, )"
+        )
+        lines.append("")
+        return lines
+
+    def genConfig(self):
+        lines = []
+
+        lines.append("# " + self.name + " Config")
+        lines.append(f"clstr.{self.name}.local = clstr.local_bus.cpu_side_ports")
+        lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
+        lines.append(f"clstr.{self.name}.pio = clstr.local_bus.mem_side_ports")
+        lines.append(f"clstr.{self.name}.debug_enabled = {str(self.debug)}")
+        lines.append("")
+
+        for master in self.master:
+            if "LocalBus" in master:
+                lines.append(
+                    "clstr." + self.name + ".pio = clstr.local_bus.mem_side_ports"
+                )
+
+        for var in self.variables:
+            # Have the variable create its config
+            lines = var.genConfig(lines)
+            lines.append("")
+
+        return lines
+
+
+class Accelerator:
     def __init__(
         self,
         name: str,
@@ -645,21 +748,12 @@ class Variable:
                 + ".status_in"
             )
             lines.append(
-                "clstr."
-                + self.outCon
-                + ".stream = "
-                + "clstr."
-                + self.name.lower()
-                + ".stream_out"
+                f"clstr.{self.outCon}.{'pe_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_out"
             )
-            lines.append(
-                "clstr."
-                + self.outCon
-                + ".stream = "
-                + "clstr."
-                + self.name.lower()
-                + ".status_out"
-            )
+            if self.outCon != "wm":
+                lines.append(
+                    f"clstr.{self.outCon}.{'pe_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.status_out"
+                )
             lines.append("")
         # Scratchpad Memory
         elif self.type == "SPM":

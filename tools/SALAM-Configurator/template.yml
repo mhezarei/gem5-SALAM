@@ -2,6 +2,7 @@
 ---
 acc_cluster:
   - Name: # Cluster name here (Required)
+  
   # NonCoherent DMA Example
   - DMA:
     - Name: # DMA name here (Required)
@@ -12,6 +13,7 @@ acc_cluster:
       # e.g. FirstAcc,SecondAcc 
       Type: # Selects the type of DMA, can be NonCoherent or Stream (Required)
       InterruptNum: # Sets the Interrupt Number (Optional)
+  
   # Streaming DMA Example
   - DMA:
     - Name: # DMA name here (Required)
@@ -22,6 +24,23 @@ acc_cluster:
       Type: # Selects the type of DMA, can be NonCoherent or Stream (Required)
       ReadInt: # Interrupt Number for when read frames are finished (Optional)
       WriteInt: # Interrupt Number for when write frames are finished (Optional)
+  
+  # Window Manager Example
+  - WindowManager:
+    - Name: # WindowManager name here(Required)
+      PIOSize: # PIO Size
+      PIOMaster: # PIO Master list (Required)
+      Debug: # True or False; prints window manager debug messages (Optional)
+    # Scratchpad Memory Example
+    - Var:
+      - Name: # Var name here (Required)
+        Type: # SPM
+        Size: # Size in Bytes (Required)
+        Ports: # Number of ports to connect to parent Acc
+        ResetOnRead: # True/False | Reset ready bit on private scratchpad memory read
+        ReadOnInvalid: # True/False | Enable reads on invalid memory segments when ready mode is used
+        WriteOnValid: # True/False | Enable writes on valid memory sectors when ready mode is used
+
   # Accelerator Example
   - Accelerator:
     - Name: # Acc name here (Required)
