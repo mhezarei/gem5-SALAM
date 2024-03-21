@@ -10,8 +10,6 @@
 #include <queue>
 #include <vector>
 
-#define NEXT_TICK nextCycle()
-
 class WindowManager : public BasicPioDevice {
 public:
   bool debug() const { return debugEnabled; }
@@ -111,9 +109,8 @@ private:
   };
 
   class Window {
-    friend class WindowManager;
-
   private:
+    std::string windowName;
     WindowManager *owner;
     Addr baseMemoryAddress;
     std::queue<MemoryRequest *> memoryRequests;
@@ -128,6 +125,7 @@ private:
     bool debug() { return owner->debug(); }
     bool sendMemoryRequest();
     void sendSPMRequest(SPMPort *spm_port, uint64_t data);
+    std::string name() const { return windowName; }
   };
 
   class TickEvent : public Event {
@@ -198,6 +196,7 @@ public:
   virtual Tick write(PacketPtr pkt) override;
   Port &getPort(const std::string &if_name,
                 PortID idx = InvalidPortID) override;
+  std::string getName() const { return name(); }
 };
 
 #endif // __HWACC_WINDOW_MANAGER_HH__
