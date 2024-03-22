@@ -154,6 +154,7 @@ private:
 
   // Class variables
   size_t requestLength;
+  std::vector<bool> finishedPEs;
 
   // SPM related info
   Addr currentFreeSPMAddress;
@@ -172,7 +173,7 @@ private:
   // TODO: this will be replaced with actual address communication
   std::map<uint8_t, Addr> sourceIDToAddr;
   std::queue<std::pair<Window *, uint64_t>> spmRetryPackets;
-  std::vector<std::pair<MemoryRequest *, Window *>> activeWindowMemoryRequests;
+  std::map<Window *, std::vector<MemoryRequest *>> activeWindowRequests;
 
   void handlePERequest(MemoryRequest *read_req);
   void handleWindowMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
@@ -188,7 +189,7 @@ private:
   GlobalPort *getValidGlobalPort(Addr add, bool read);
   SPMPort *findAvailableSPMPort();
   Window *findCorrespondingWindow(PacketPtr pkt);
-  void removeActiveWindowRequest(MemoryRequest *mem_req);
+  void removeCorrespondingWindow(MemoryRequest *mem_req);
 
 public:
   WindowManager(const WindowManagerParams &p);

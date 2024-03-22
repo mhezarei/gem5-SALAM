@@ -38,6 +38,13 @@ void WindowManager::recvPacket(PacketPtr pkt) {
               pkt->req->getPaddr(), pkt->getSize(), read_req->printBuffer());
 
     if (PEPort *pe_port = dynamic_cast<PEPort *>(carrier_port)) {
+      if (*((uint64_t *)read_req->getBuffer()) == 0xFFFFFFFF) {
+        finishedPEs.push_back(true);
+        removeMemRequest(read_req, activeReadRequests);
+        scheduleEvent();
+        delete pkt;
+        return;
+      }
       handlePERequest(read_req);
     } else if (GlobalPort *global_port =
                    dynamic_cast<GlobalPort *>(carrier_port)) {
@@ -45,6 +52,7 @@ void WindowManager::recvPacket(PacketPtr pkt) {
     }
 
     removeMemRequest(read_req, activeReadRequests);
+    delete read_req;
   } else if (pkt->isWrite()) {
     MemoryRequest *write_req = findMemRequest(pkt, activeWriteRequests);
     if (SPMPort *port = dynamic_cast<SPMPort *>(write_req->getCarrierPort())) {
@@ -55,6 +63,7 @@ void WindowManager::recvPacket(PacketPtr pkt) {
       panic("WE ARE DROWNING!\n");
     }
 
+    removeCorrespondingWindow(write_req);
     removeMemRequest(write_req, activeWriteRequests);
     delete write_req;
   } else {
@@ -69,12 +78,25 @@ void WindowManager::tick() {
   if (debug())
     DPRINTF(WindowManager, "Tick!\n");
 
+  if (activeWindowRequests.empty() &&
+      finishedPEs.size() == peStreamPorts.size()) {
+    *mmr &= 0xfc;
+    *mmr |= 0x04;
+    return;
+  }
+
   // Check all the pe ports for incoming requests
   for (PEPort *port : peStreamPorts) {
     if (checkPort(port, requestLength, true)) {
       readFromPort(port, port->getStartAddress(), requestLength);
     }
   }
+
+  // remove non-active window requests
+  for (auto it = activeWindowRequests.begin(); it != activeWindowRequests.end();
+       it++)
+    if (it->second.empty())
+      activeWindowRequests.erase(it);
 
   // check the single ongoing Window (head of the queue)
   if (ongoingWindows.size()) {
@@ -130,7 +152,7 @@ void WindowManager::handleWindowMemoryResponse(PacketPtr pkt,
     window->sendSPMRequest(spm_port, data);
   }
 
-  removeActiveWindowRequest(read_req);
+  removeCorrespondingWindow(read_req);
 }
 
 void WindowManager::readFromPort(RequestPort *port, Addr addr, size_t len) {
@@ -212,8 +234,11 @@ WindowManager::GlobalPort *WindowManager::getValidGlobalPort(Addr add,
   for (auto port : globalPorts) {
     AddrRangeList adl = port->getAddrRanges();
     for (auto address : adl)
-      if (address.contains(add))
+      if (address.contains(add) && !(port->hasRetryPackets()))
         return port;
+      else if (debug())
+        DPRINTF(WindowManager, "I have got %d retry packets bruv\n",
+                port->retryPackets.size());
   }
   return nullptr;
 }
@@ -320,6 +345,7 @@ void WindowManager::SPMPort::sendPacket(PacketPtr pkt) {
 }
 /* SPMPort functions end */
 
+/* Helper functions start */
 std::string WindowManager::PEPort::getPENameFromPeerPort() {
   // TODO: find a way to get the PE name from the port
   if (!isConnected())
@@ -328,7 +354,6 @@ std::string WindowManager::PEPort::getPENameFromPeerPort() {
   return std::to_string(getId());
 }
 
-/* Helper functions start */
 bool WindowManager::checkPort(RequestPort *port, size_t len, bool isRead) {
   if (PEPort *pePort = dynamic_cast<PEPort *>(port))
     return pePort->streamValid(len, isRead);
@@ -389,20 +414,6 @@ WindowManager::findMemRequest(PacketPtr pkt,
   return nullptr;
 }
 
-WindowManager::Window *WindowManager::findCorrespondingWindow(PacketPtr pkt) {
-  auto it = find_if(begin(activeWindowMemoryRequests),
-                    end(activeWindowMemoryRequests),
-                    [&pkt](const std::pair<MemoryRequest *, Window *> &elem) {
-                      return elem.first->getPacket() == pkt;
-                    });
-
-  if (it != end(activeWindowMemoryRequests))
-    return it->second;
-
-  panic("Could not find memory request in vector of <window, req> pairs\n");
-  return nullptr;
-}
-
 void WindowManager::removeMemRequest(MemoryRequest *memReq,
                                      std::vector<MemoryRequest *> &targetVec) {
   if (debug())
@@ -428,16 +439,27 @@ void WindowManager::removeMemRequest(MemoryRequest *memReq,
   //           removal)\n");
 }
 
-void WindowManager::removeActiveWindowRequest(MemoryRequest *mem_req) {
+WindowManager::Window *WindowManager::findCorrespondingWindow(PacketPtr pkt) {
+  for (const auto &elem : activeWindowRequests)
+    for (const auto &req : elem.second)
+      if (req->getPacket() == pkt)
+        return elem.first;
+
+  panic("Could not find memory request in active window requests map\n");
+  return nullptr;
+}
+
+void WindowManager::removeCorrespondingWindow(MemoryRequest *mem_req) {
   if (debug())
     DPRINTF(WindowManager, "Clearing Request with addr 0x%016x\n",
             mem_req->getAddress());
 
-  for (auto it = activeWindowMemoryRequests.begin();
-       it != activeWindowMemoryRequests.end(); ++it) {
-    if (it->first == mem_req) {
-      it = activeWindowMemoryRequests.erase(it);
-      break;
+  for (const auto &elem : activeWindowRequests) {
+    for (auto it = elem.second.begin(); it != elem.second.end(); ++it) {
+      if (*it == mem_req) {
+        activeWindowRequests[elem.first].erase(it);
+        break;
+      }
     }
   }
 }
@@ -458,7 +480,6 @@ WindowManager::Window::Window(WindowManager *owner, Addr base_memory_addr,
                                                flags, owner->masterId);
     PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
 
-    read_req->setCarrierPort(owner->getValidGlobalPort(req_addr, true));
     read_req->setPacket(pkt);
     pkt->allocate();
 
@@ -473,23 +494,30 @@ bool WindowManager::Window::sendMemoryRequest() {
     return false;
   }
 
-  MemoryRequest *req = memoryRequests.front();
-  sentMemoryRequests.push_back(req);
-  owner->activeWindowMemoryRequests.push_back(std::make_pair(req, this));
-  owner->activeReadRequests.push_back(req);
+  MemoryRequest *read_req = memoryRequests.front();
 
-  if (GlobalPort *memory_port =
-          dynamic_cast<GlobalPort *>(req->getCarrierPort())) {
+  if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+          owner->getValidGlobalPort(read_req->getAddress(), true))) {
     if (debug())
       DPRINTF(Window,
               "Trying to request addr: 0x%016x, %d bytes through port: %s\n",
-              req->getAddress(), req->getLength(), memory_port->name());
-    memory_port->sendPacket(req->getPacket());
+              read_req->getAddress(), read_req->getLength(),
+              memory_port->name());
+
+    read_req->setCarrierPort(memory_port);
+    memory_port->sendPacket(read_req->getPacket());
+
+    sentMemoryRequests.push_back(read_req);
+    owner->activeReadRequests.push_back(read_req);
+    owner->activeWindowRequests[this].push_back(read_req);
+    memoryRequests.pop();
   } else {
-    panic("WE ARE DROWNED!\n");
+    if (debug())
+      DPRINTF(Window,
+              "Did not find a global port to read %d bytes from 0x%016x\n",
+              read_req->getLength(), read_req->getAddress());
   }
 
-  memoryRequests.pop();
   return true;
 }
 
@@ -503,19 +531,22 @@ void WindowManager::Window::sendSPMRequest(WindowManager::SPMPort *spm_port,
                                              owner->masterId);
   PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
 
+  if (debug())
+    DPRINTF(
+        Window,
+        "Trying to write to addr: 0x%016x, %d bytes, holding 0x%016x value, "
+        "through port: %s\n",
+        addr, owner->requestLength, data, spm_port->name());
+
   write_req->setCarrierPort(spm_port);
   req->setExtraData(data);
   write_req->setPacket(pkt);
   pkt->allocate();
   spm_port->sendPacket(pkt);
+
   owner->activeWriteRequests.push_back(write_req);
+  owner->activeWindowRequests[this].push_back(write_req);
 
   currentSPMOffset += owner->requestLength;
-
-  if (debug())
-    DPRINTF(Window,
-            "Trying to write to addr: 0x%016x, %d bytes, holding %lld value, "
-            "through port: %s\n",
-            addr, owner->requestLength, data, spm_port->name());
 }
 /* Window functions end */
