@@ -170,6 +170,13 @@ class AccCluster:
                         varParams["Address"] = top_address
                         varParams["AccName"] = name
 
+                        if varParams["Type"] == "Stream":
+                            aligned_inc = int(var["StreamSize"] + 4) + (
+                                64 - (int(var["StreamSize"] + 4) % 64)
+                            )
+                            statusAddress = top_address + aligned_inc
+                            varParams["StatusAddress"] = statusAddress
+
                         # Create and append a new variable
                         variables.append(Variable(**varParams))
                         # Increment the current address based on size
@@ -178,6 +185,13 @@ class AccCluster:
                                 64 - (int(var["Size"]) % 64)
                             )
                             top_address += aligned_inc
+                        elif "Stream" in var["Type"]:
+                            statusSize = 4
+                            aligned_inc = int(var["StreamSize"] + 4) + (
+                                64 - (int(var["StreamSize"] + 4) % 64)
+                            )
+                            status_inc = int(statusSize) + (64 - (int(statusSize) % 64))
+                            top_address += aligned_inc + status_inc
                         else:
                             # Should never get here... but just in case throw an exception
                             exceptionString = f"The Variable: {name} has an invalid type named: {var['Type']}"
@@ -732,27 +746,18 @@ class Variable:
                 + ")"
             )
             lines.append(
-                "clstr."
-                + self.inCon
-                + ".stream = "
-                + "clstr."
-                + self.name.lower()
-                + ".stream_in"
+                f"clstr.{self.inCon}.{'pe_resp_stream_ports' if self.inCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_in"
             )
+            if self.inCon != "wm":
+                lines.append(
+                    f"clstr.{self.inCon}.stream = clstr.{self.name.lower()}.status_in"
+                )
             lines.append(
-                "clstr."
-                + self.inCon
-                + ".stream = "
-                + "clstr."
-                + self.name.lower()
-                + ".status_in"
-            )
-            lines.append(
-                f"clstr.{self.outCon}.{'pe_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_out"
+                f"clstr.{self.outCon}.{'pe_req_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_out"
             )
             if self.outCon != "wm":
                 lines.append(
-                    f"clstr.{self.outCon}.{'pe_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.status_out"
+                    f"clstr.{self.outCon}.stream = clstr.{self.name.lower()}.status_out"
                 )
             lines.append("")
         # Scratchpad Memory

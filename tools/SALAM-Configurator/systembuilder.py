@@ -363,9 +363,21 @@ def gen_header(header_list, clusters, working_dir: str):
                         "#define " + wm.name.upper() + " " + hex(wm.pio_addr) + "\n"
                     )
                     for var in wm.variables:
-                        current_header.append(
-                            "#define " + var.name + " " + hex(var.address) + "\n"
-                        )
+                        if "Stream" in var.type:
+                            current_header.append(
+                                "#define " + var.name + " " + hex(var.address) + "\n"
+                            )
+                            current_header.append(
+                                "#define "
+                                + var.name
+                                + "_Status "
+                                + hex(var.statusAddress)
+                                + "\n"
+                            )
+                        else:
+                            current_header.append(
+                                "#define " + var.name + " " + hex(var.address) + "\n"
+                            )
 
                 current_header.append("//END GENERATED CODE")
                 f.writelines(current_header)
