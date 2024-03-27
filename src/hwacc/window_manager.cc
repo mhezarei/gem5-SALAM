@@ -14,11 +14,12 @@ WindowManager::WindowManager(const WindowManagerParams &p)
       masterId(p.system->getRequestorId(this, name())), io_size(p.pio_size),
       io_addr(p.pio_addr), endian(p.system->getGuestByteOrder()) {
   processingDelay = 1000 * clockPeriod;
-  requestLength = 4;
-  sourceIDToAddr[1] = (Addr)(0x80c00000);
-  sourceIDToAddr[2] = (Addr)(0x80c00190);
 
-  spmSize = 512;
+  peRequestLength = 8;
+  dataSize = 4;
+  endToken = 0xFFFFFFFFFFFFFFFF;
+
+  spmSize = 2048;
   currentFreeSPMAddress = 0x10021080;
 
   mmr = new uint8_t[io_size];
@@ -38,14 +39,14 @@ void WindowManager::recvPacket(PacketPtr pkt) {
               pkt->req->getPaddr(), pkt->getSize(), read_req->printBuffer());
 
     if (PEPort *pe_port = dynamic_cast<PEPort *>(carrier_port)) {
-      if (*((uint64_t *)read_req->getBuffer()) == 0xFFFFFFFF) {
+      if (*((uint64_t *)read_req->getBuffer()) == endToken) {
         finishedPEs.push_back(true);
         removeMemRequest(read_req, activeReadRequests);
         scheduleEvent();
         delete pkt;
         return;
       }
-      handlePERequest(read_req);
+      handlePERequest(read_req, pe_port);
     } else if (GlobalPort *global_port =
                    dynamic_cast<GlobalPort *>(carrier_port)) {
       handleWindowMemoryResponse(pkt, read_req);
@@ -55,7 +56,13 @@ void WindowManager::recvPacket(PacketPtr pkt) {
     delete read_req;
   } else if (pkt->isWrite()) {
     MemoryRequest *write_req = findMemRequest(pkt, activeWriteRequests);
-    if (SPMPort *port = dynamic_cast<SPMPort *>(write_req->getCarrierPort())) {
+    RequestPort *carrier_port = write_req->getCarrierPort();
+    if (SPMPort *port = dynamic_cast<SPMPort *>(carrier_port)) {
+      removeCorrespondingWindowRequest(write_req);
+      if (debug())
+        DPRINTF(WindowManager, "Done with a write. addr: 0x%x, size: %d\n",
+                pkt->req->getPaddr(), pkt->getSize());
+    } else if (PEPort *port = dynamic_cast<PEPort *>(carrier_port)) {
       if (debug())
         DPRINTF(WindowManager, "Done with a write. addr: 0x%x, size: %d\n",
                 pkt->req->getPaddr(), pkt->getSize());
@@ -63,7 +70,6 @@ void WindowManager::recvPacket(PacketPtr pkt) {
       panic("WE ARE DROWNING!\n");
     }
 
-    removeCorrespondingWindow(write_req);
     removeMemRequest(write_req, activeWriteRequests);
     delete write_req;
   } else {
@@ -78,32 +84,38 @@ void WindowManager::tick() {
   if (debug())
     DPRINTF(WindowManager, "Tick!\n");
 
+  // turning off condition
   if (activeWindowRequests.empty() &&
-      finishedPEs.size() == peStreamPorts.size()) {
+      finishedPEs.size() == peRequestStreamPorts.size()) {
     *mmr &= 0xfc;
     *mmr |= 0x04;
     return;
   }
 
   // Check all the pe ports for incoming requests
-  for (PEPort *port : peStreamPorts) {
-    if (checkPort(port, requestLength, true)) {
-      readFromPort(port, port->getStartAddress(), requestLength);
+  for (PEPort *port : peRequestStreamPorts) {
+    if (checkPort(port, peRequestLength, true)) {
+      readFromPort(port, port->getStartAddress(), peRequestLength);
     }
   }
 
-  // remove non-active window requests
+  // remove windows without any requests
   for (auto it = activeWindowRequests.begin(); it != activeWindowRequests.end();
        it++)
-    if (it->second.empty())
+    if (it->second.empty()) {
+      // respond to the corresponding PE
+      Window *window = it->first;
+      sendPEResponse(window->getCorrespondingPEPort(),
+                     window->getSPMBaseAddr());
+
       activeWindowRequests.erase(it);
+    }
 
   // check the single ongoing Window (head of the queue)
   if (ongoingWindows.size()) {
     if (debug())
       DPRINTF(WindowManager, "Going over the head window...\n");
-    Window *window = ongoingWindows.front();
-    if (!window->sendMemoryRequest()) {
+    if (!ongoingWindows.front()->sendMemoryRequest()) {
       ongoingWindows.pop();
     }
   }
@@ -115,7 +127,7 @@ void WindowManager::tick() {
 
     Window *window = spmRetryPackets.front().first;
     uint64_t data = spmRetryPackets.front().second;
-    window->sendSPMRequest(spmPort, data);
+    window->sendSPMRequest(data);
     spmRetryPackets.pop();
   }
 
@@ -124,35 +136,33 @@ void WindowManager::tick() {
 }
 
 /* Utility functions start */
-void WindowManager::handlePERequest(MemoryRequest *read_req) {
+void WindowManager::handlePERequest(MemoryRequest *read_req, PEPort *pe_port) {
   // Necessary steps for window creation
   PERequest pe_req = constructPERequestFromReadRequest(read_req);
-  Addr base_addr = sourceIDToAddr[pe_req.sourceID];
+  Addr base_addr = pe_req.sourceAddr;
   std::vector<Offset> offsets;
   for (uint16_t idx = pe_req.startElement;
        idx < pe_req.startElement + pe_req.length; idx++)
-    offsets.push_back(idx * requestLength);
+    offsets.push_back(idx * dataSize);
 
-  Window *window = new Window(this, base_addr, offsets, currentFreeSPMAddress);
+  Window *window =
+      new Window(this, base_addr, offsets, currentFreeSPMAddress, pe_port);
   ongoingWindows.push(window);
 
   // Move the SPM poninter based on PE request
-  currentFreeSPMAddress += pe_req.length * requestLength;
+  currentFreeSPMAddress += pe_req.length * dataSize;
 }
 
 void WindowManager::handleWindowMemoryResponse(PacketPtr pkt,
                                                MemoryRequest *read_req) {
   Window *window = findCorrespondingWindow(pkt);
   uint64_t data = *((uint64_t *)read_req->getBuffer());
-  SPMPort *spm_port = findAvailableSPMPort();
 
-  if (!spm_port) {
+  if (!window->sendSPMRequest(data)) {
     spmRetryPackets.push(std::make_pair(window, data));
-  } else {
-    window->sendSPMRequest(spm_port, data);
   }
 
-  removeCorrespondingWindow(read_req);
+  removeCorrespondingWindowRequest(read_req);
 }
 
 void WindowManager::readFromPort(RequestPort *port, Addr addr, size_t len) {
@@ -176,6 +186,57 @@ void WindowManager::readFromPort(RequestPort *port, Addr addr, size_t len) {
             len, port->name());
 
   scheduleEvent();
+}
+
+MemoryRequest *WindowManager::writeToPort(RequestPort *req_port, uint64_t input,
+                                          Addr addr) {
+  MemoryRequest *write_req =
+      new MemoryRequest(addr, (uint8_t *)&input, dataSize);
+  Request::Flags flags;
+  RequestPtr req = std::make_shared<Request>(addr, dataSize, flags, masterId);
+  uint8_t *data = new uint8_t[dataSize];
+  std::memcpy(data, write_req->getBuffer(), dataSize);
+  req->setExtraData((uint64_t)data);
+  write_req->setCarrierPort(req_port);
+
+  if (debug())
+    DPRINTF(
+        WindowManager,
+        "Trying to write to addr: 0x%016x, %d bytes, holding 0x%016x value, "
+        "through port: %s\n",
+        addr, dataSize, *((uint64_t *)write_req->getBuffer()),
+        req_port->name());
+
+  PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+  uint8_t *pkt_data = (uint8_t *)req->getExtraData();
+  pkt->dataDynamic(pkt_data);
+  write_req->setPacket(pkt);
+
+  if (PEPort *port = dynamic_cast<PEPort *>(req_port)) {
+    port->sendPacket(pkt);
+  } else if (SPMPort *port = dynamic_cast<SPMPort *>(req_port)) {
+    port->sendPacket(pkt);
+  } else {
+    panic("sending port is not suitable for writing");
+  }
+
+  return write_req;
+}
+
+void WindowManager::sendPEResponse(PEPort *req_pe_port, Addr spm_addr) {
+  int port_idx =
+      std::distance(peRequestStreamPorts.begin(),
+                    std::find(peRequestStreamPorts.begin(),
+                              peRequestStreamPorts.end(), req_pe_port));
+  assert(port_idx < peResponseStreamPorts.size());
+
+  PEPort *pe_resp_port = peResponseStreamPorts[port_idx];
+  Addr destination_addr = pe_resp_port->getStartAddress();
+
+  MemoryRequest *write_req =
+      writeToPort(pe_resp_port, spm_addr, destination_addr);
+
+  activeWriteRequests.push_back(write_req);
 }
 
 Tick WindowManager::read(PacketPtr pkt) {
@@ -253,18 +314,21 @@ WindowManager::SPMPort *WindowManager::findAvailableSPMPort() {
 WindowManager::PERequest
 WindowManager::constructPERequestFromReadRequest(MemoryRequest *read_req) {
   size_t read_len = read_req->getLength();
-  if (read_len == 4) { // 4 bytes
+  if (read_len == 8) { // 8 bytes
     assert(read_req->getTotalLength() == (Tick)read_len);
 
-    uint32_t result = 0;
+    uint64_t result = 0;
     for (int i = read_req->getTotalLength() - 1; i >= 0; i--)
       result = (result << 8) + read_req->getBuffer()[i];
 
-    return (PERequest){(uint8_t)(result >> 24), (uint16_t)((result << 8) >> 16),
-                       (uint8_t)((result << 24) >> 24)};
+    uint32_t source_addr = result >> 32;
+    uint16_t start_element = (result >> 16) & 0x000000000000FFFF;
+    uint16_t length = result & 0x000000000000FFFF;
+
+    return (PERequest){source_addr, start_element, length};
   }
 
-  panic("Can't handle read lengths other than 4 for now!\n");
+  panic("Can't handle read lengths other than 8 for now!\n");
   return (PERequest){0, 0, 0};
 }
 
@@ -354,9 +418,9 @@ std::string WindowManager::PEPort::getPENameFromPeerPort() {
   return std::to_string(getId());
 }
 
-bool WindowManager::checkPort(RequestPort *port, size_t len, bool isRead) {
+bool WindowManager::checkPort(RequestPort *port, size_t len, bool is_read) {
   if (PEPort *pePort = dynamic_cast<PEPort *>(port))
-    return pePort->streamValid(len, isRead);
+    return pePort->streamValid(len, is_read);
 
   return false;
 }
@@ -386,15 +450,24 @@ Port &WindowManager::getPort(const std::string &if_name, PortID idx) {
       spmPorts[idx] = new SPMPort(portName, this, idx);
     }
     return *spmPorts[idx];
-  } else if (if_name == "pe_stream_ports") {
-    if (idx >= peStreamPorts.size())
-      peStreamPorts.resize((idx + 1));
-    if (peStreamPorts[idx] == nullptr) {
+  } else if (if_name == "pe_req_stream_ports") {
+    if (idx >= peRequestStreamPorts.size())
+      peRequestStreamPorts.resize((idx + 1));
+    if (peRequestStreamPorts[idx] == nullptr) {
       const std::string portName =
-          name() + csprintf(".pe_stream_ports[%d]", idx);
-      peStreamPorts[idx] = new PEPort(portName, this, idx);
+          name() + csprintf(".pe_req_stream_ports[%d]", idx);
+      peRequestStreamPorts[idx] = new PEPort(portName, this, idx);
     }
-    return *peStreamPorts[idx];
+    return *peRequestStreamPorts[idx];
+  } else if (if_name == "pe_resp_stream_ports") {
+    if (idx >= peResponseStreamPorts.size())
+      peResponseStreamPorts.resize((idx + 1));
+    if (peResponseStreamPorts[idx] == nullptr) {
+      const std::string portName =
+          name() + csprintf(".pe_resp_stream_ports[%d]", idx);
+      peResponseStreamPorts[idx] = new PEPort(portName, this, idx);
+    }
+    return *peResponseStreamPorts[idx];
   } else {
     return BasicPioDevice::getPort(if_name, idx);
   }
@@ -402,36 +475,36 @@ Port &WindowManager::getPort(const std::string &if_name, PortID idx) {
 
 MemoryRequest *
 WindowManager::findMemRequest(PacketPtr pkt,
-                              const std::vector<MemoryRequest *> &targetVec) {
+                              const std::vector<MemoryRequest *> &target_vec) {
   auto it =
-      find_if(begin(targetVec), end(targetVec),
+      find_if(begin(target_vec), end(target_vec),
               [&pkt](MemoryRequest *mr) { return mr->getPacket() == pkt; });
 
-  if (it != end(targetVec))
+  if (it != end(target_vec))
     return *it;
 
   panic("Could not find memory request in request queues");
   return nullptr;
 }
 
-void WindowManager::removeMemRequest(MemoryRequest *memReq,
-                                     std::vector<MemoryRequest *> &targetVec) {
+void WindowManager::removeMemRequest(MemoryRequest *mem_req,
+                                     std::vector<MemoryRequest *> &target_vec) {
   if (debug())
     DPRINTF(WindowManager, "Clearing Request with addr 0x%016x\n",
-            memReq->getAddress());
+            mem_req->getAddress());
 
-  for (auto it = targetVec.begin(); it != targetVec.end(); ++it) {
-    if ((*it) == memReq) {
-      it = targetVec.erase(it);
+  for (auto it = target_vec.begin(); it != target_vec.end(); ++it) {
+    if ((*it) == mem_req) {
+      it = target_vec.erase(it);
       break;
     }
   }
 
   // TODO This is really wired. The code below should work but it doesn't.
   // auto it =
-  //     find_if(begin(targetVec), end(targetVec),
+  //     find_if(begin(target_vec), end(target_vec),
   //             [&memReq](const MemoryRequest * mr) { return mr == memReq; });
-  // if (it != end(targetVec))
+  // if (it != end(target_vec))
   //   readMemReqs.erase(it);
   // else
   //   DPRINTF(WindowManager,
@@ -449,7 +522,7 @@ WindowManager::Window *WindowManager::findCorrespondingWindow(PacketPtr pkt) {
   return nullptr;
 }
 
-void WindowManager::removeCorrespondingWindow(MemoryRequest *mem_req) {
+void WindowManager::removeCorrespondingWindowRequest(MemoryRequest *mem_req) {
   if (debug())
     DPRINTF(WindowManager, "Clearing Request with addr 0x%016x\n",
             mem_req->getAddress());
@@ -468,16 +541,17 @@ void WindowManager::removeCorrespondingWindow(MemoryRequest *mem_req) {
 /* Window functions start */
 WindowManager::Window::Window(WindowManager *owner, Addr base_memory_addr,
                               const std::vector<Offset> &offsets,
-                              Addr base_spm_addr)
+                              Addr base_spm_addr, PEPort *pe_port)
     : windowName("Window"), owner(owner), baseMemoryAddress(base_memory_addr),
-      spmBaseAddr(base_spm_addr), currentSPMOffset(0) {
+      spmBaseAddr(base_spm_addr), currentSPMOffset(0),
+      correspondingPEPort(pe_port) {
   for (Offset o : offsets) {
     Addr req_addr = baseMemoryAddress + o;
 
-    MemoryRequest *read_req = new MemoryRequest(req_addr, owner->requestLength);
+    MemoryRequest *read_req = new MemoryRequest(req_addr, owner->dataSize);
     Request::Flags flags;
-    RequestPtr req = std::make_shared<Request>(req_addr, owner->requestLength,
-                                               flags, owner->masterId);
+    RequestPtr req = std::make_shared<Request>(req_addr, owner->dataSize, flags,
+                                               owner->masterId);
     PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
 
     read_req->setPacket(pkt);
@@ -507,7 +581,6 @@ bool WindowManager::Window::sendMemoryRequest() {
     read_req->setCarrierPort(memory_port);
     memory_port->sendPacket(read_req->getPacket());
 
-    sentMemoryRequests.push_back(read_req);
     owner->activeReadRequests.push_back(read_req);
     owner->activeWindowRequests[this].push_back(read_req);
     memoryRequests.pop();
@@ -521,32 +594,19 @@ bool WindowManager::Window::sendMemoryRequest() {
   return true;
 }
 
-void WindowManager::Window::sendSPMRequest(WindowManager::SPMPort *spm_port,
-                                           uint64_t data) {
+bool WindowManager::Window::sendSPMRequest(uint64_t data) {
   // create the SPM write packet and send it!
   Addr addr = spmBaseAddr + currentSPMOffset;
-  MemoryRequest *write_req = new MemoryRequest(addr, owner->requestLength);
-  Request::Flags flags;
-  RequestPtr req = std::make_shared<Request>(addr, owner->requestLength, flags,
-                                             owner->masterId);
-  PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+  SPMPort *spm_port = owner->findAvailableSPMPort();
+  if (!spm_port)
+    return false;
 
-  if (debug())
-    DPRINTF(
-        Window,
-        "Trying to write to addr: 0x%016x, %d bytes, holding 0x%016x value, "
-        "through port: %s\n",
-        addr, owner->requestLength, data, spm_port->name());
-
-  write_req->setCarrierPort(spm_port);
-  req->setExtraData(data);
-  write_req->setPacket(pkt);
-  pkt->allocate();
-  spm_port->sendPacket(pkt);
+  MemoryRequest *write_req = owner->writeToPort(spm_port, data, addr);
 
   owner->activeWriteRequests.push_back(write_req);
   owner->activeWindowRequests[this].push_back(write_req);
 
-  currentSPMOffset += owner->requestLength;
+  currentSPMOffset += owner->dataSize;
+  return true;
 }
 /* Window functions end */

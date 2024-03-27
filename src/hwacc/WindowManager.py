@@ -20,7 +20,10 @@ class WindowManager(BasicPioDevice):
     )
 
     spm = VectorRequestPort("Request ports connected to private scratchpad memory")
-    pe_stream_ports = VectorRequestPort(
+    pe_req_stream_ports = VectorRequestPort(
+        "Request ports connected to processing element queues"
+    )
+    pe_resp_stream_ports = VectorRequestPort(
         "Request ports connected to processing element queues"
     )
     local = VectorRequestPort("Request ports connected to local cluster xbar")

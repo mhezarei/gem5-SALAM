@@ -15,11 +15,11 @@ public:
   bool debug() const { return debugEnabled; }
 
 private:
-  // TODO: change sourceID to real address
+  // TODO: change sourceID to real 64b address
   struct PERequest {
-    uint8_t sourceID;
+    uint32_t sourceAddr;
     uint16_t startElement;
-    uint8_t length;
+    uint16_t length;
   };
   typedef uint64_t Offset;
 
@@ -114,18 +114,21 @@ private:
     WindowManager *owner;
     Addr baseMemoryAddress;
     std::queue<MemoryRequest *> memoryRequests;
-    std::vector<MemoryRequest *> sentMemoryRequests;
 
     Addr spmBaseAddr;
     Offset currentSPMOffset;
+    PEPort *correspondingPEPort;
 
   public:
     Window(WindowManager *owner, Addr base_memory_addr,
-           const std::vector<Offset> &offsets, Addr base_spm_addr);
+           const std::vector<Offset> &offsets, Addr base_spm_addr,
+           PEPort *pe_port);
     bool debug() { return owner->debug(); }
     bool sendMemoryRequest();
-    void sendSPMRequest(SPMPort *spm_port, uint64_t data);
+    bool sendSPMRequest(uint64_t data);
     std::string name() const { return windowName; }
+    PEPort *getCorrespondingPEPort() { return correspondingPEPort; }
+    Addr getSPMBaseAddr() { return spmBaseAddr; }
   };
 
   class TickEvent : public Event {
@@ -153,8 +156,9 @@ private:
   ByteOrder endian;
 
   // Class variables
-  size_t requestLength;
+  size_t peRequestLength, dataSize;
   std::vector<bool> finishedPEs;
+  uint64_t endToken;
 
   // SPM related info
   Addr currentFreeSPMAddress;
@@ -164,32 +168,34 @@ private:
   std::vector<SPMPort *> spmPorts;
   std::vector<LocalPort *> localPorts;
   std::vector<GlobalPort *> globalPorts;
-  std::vector<PEPort *> peStreamPorts;
+  std::vector<PEPort *> peRequestStreamPorts;
+  std::vector<PEPort *> peResponseStreamPorts;
 
   // Necessary data structures
   std::vector<MemoryRequest *> activeReadRequests;
   std::vector<MemoryRequest *> activeWriteRequests;
   std::queue<Window *> ongoingWindows;
-  // TODO: this will be replaced with actual address communication
-  std::map<uint8_t, Addr> sourceIDToAddr;
   std::queue<std::pair<Window *, uint64_t>> spmRetryPackets;
   std::map<Window *, std::vector<MemoryRequest *>> activeWindowRequests;
 
-  void handlePERequest(MemoryRequest *read_req);
+  MemoryRequest *writeToPort(RequestPort *port, uint64_t data,
+                             Addr destination_addr);
+  void handlePERequest(MemoryRequest *read_req, PEPort *pe_port);
   void handleWindowMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
+  void sendPEResponse(PEPort *pe_port, Addr spm_addr);
   void scheduleEvent(Tick when = 0);
   void recvPacket(PacketPtr pkt);
-  bool checkPort(RequestPort *port, size_t len, bool isRead);
+  bool checkPort(RequestPort *port, size_t len, bool is_read);
   void readFromPort(RequestPort *port, Addr addr, size_t len);
   MemoryRequest *findMemRequest(PacketPtr pkt,
-                                const std::vector<MemoryRequest *> &targetVec);
+                                const std::vector<MemoryRequest *> &target_vec);
   void removeMemRequest(MemoryRequest *mem_req,
-                        std::vector<MemoryRequest *> &targetVec);
+                        std::vector<MemoryRequest *> &target_vec);
   PERequest constructPERequestFromReadRequest(MemoryRequest *read_req);
   GlobalPort *getValidGlobalPort(Addr add, bool read);
   SPMPort *findAvailableSPMPort();
   Window *findCorrespondingWindow(PacketPtr pkt);
-  void removeCorrespondingWindow(MemoryRequest *mem_req);
+  void removeCorrespondingWindowRequest(MemoryRequest *mem_req);
 
 public:
   WindowManager(const WindowManagerParams &p);
