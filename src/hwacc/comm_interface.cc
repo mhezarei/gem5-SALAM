@@ -533,7 +533,7 @@ CommInterface::tryWrite(MemSidePort * port) {
 
 
     if (debug()) DPRINTF(CommInterface, "totalLength: %d, writeLeft: %d\n", writeReq->totalLength, writeReq->writeLeft);
-    if (debug()) DPRINTF(CommInterface, "Trying to write to addr: 0x%016x, %d bytes, data 0x%08x through port: %s\n",
+    if (debug()) DPRINTF(CommInterface, "Trying to write to addr: 0x%016x, %d bytes, data 0x%016x through port: %s\n",
         writeReq->currentWriteAddr, size,
         *((uint64_t*)(&(writeReq->buffer[writeReq->totalLength-writeReq->writeLeft]))),
         port->name());

@@ -15,11 +15,14 @@ public:
   bool debug() const { return debugEnabled; }
 
 private:
-  // TODO: change sourceID to real 64b address
-  struct PERequest {
+  struct PESignalRequest {
     uint32_t sourceAddr;
     uint16_t startElement;
     uint16_t length;
+  };
+  struct PETimeseriesRequest {
+    uint64_t startTimestamp;
+    uint64_t endTimestamp;
   };
   typedef uint64_t Offset;
 
@@ -108,6 +111,78 @@ private:
         : GenericRequestPort(name, owner, id) {}
   };
 
+  class TimeseriesWindow {
+  private:
+    enum State {
+      none,
+      requestCoreStart,
+      waitingCoreRangeStart,
+      requestCoreEnd,
+      waitingCoreRangeEnd,
+      checkRange,
+      requestChildAddress,
+      waitingChildAddress,
+      firstScanDone,
+
+      initTraverse,
+      requestStat,
+      waitingStat,
+      startTraverse,
+      requestTraverseChildren,
+      waitingTraverseChildren,
+
+      computeStat,
+      computeStat_RequestLeafChildrenStartAddress,
+      computeStat_WaitingLeafChildStartAddress,
+      computeStat_RequestCoreChildren,
+      computeStat_WaitingCoreChildren,
+      computeStat_RequestCoreChildStat,
+      computeStat_WaitingCoreChildStat,
+      computeStat_RequestResult,
+      computeStat_WaitingResult,
+      computeStat_SaveResult,
+      computeStat_WaitingSaveResult,
+
+      done
+    } state;
+
+    std::string windowName;
+    WindowManager *owner;
+    PETimeseriesRequest peRequest;
+    PEPort *correspondingPEPort;
+    std::queue<Addr> computationCores;
+    std::queue<Addr> coreQueue;
+    int batchSize;
+    int numChildren;
+    int numReceivedChildren;
+    Addr currentCoreAddr;
+    uint64_t currentCoreStart, currentCoreEnd;
+
+    // traversal info
+    std::stack<std::pair<Addr, bool>> traverseStack;
+    std::vector<uint64_t> endResults;
+    Addr leavesStartAddr, leavesEndAddr;
+    std::pair<Addr, bool> traverseStackHead;
+    PEPort *openPEPort;
+    Addr currentCoreChildAddress;
+    uint64_t computedResult;
+    uint64_t numCheckedNodes;
+
+  public:
+    TimeseriesWindow(WindowManager *owner, PEPort *pe_port);
+    bool debug() { return owner->debug(); }
+    void setPERequest(uint64_t value); // sets either start or end
+    std::string name() const { return windowName; }
+    bool samePEPort(PEPort *pe_port) { return correspondingPEPort == pe_port; }
+    PETimeseriesRequest getPERequest() { return peRequest; }
+    void firstScanTick();
+    void traverseTick();
+    void handleResponseData(uint64_t data);
+    bool isDone() { return state == done; }
+    PEPort *findPEPortForComputeState();
+    bool isLeafNode(Addr node_addr);
+  };
+
   class Window {
   private:
     std::string windowName;
@@ -156,9 +231,10 @@ private:
   ByteOrder endian;
 
   // Class variables
-  size_t peRequestLength, dataSize;
+  size_t peRequestLength, dataSize, tsDataSize;
   std::vector<bool> finishedPEs;
   uint64_t endToken;
+  Addr coresStartAddr;
 
   // SPM related info
   Addr currentFreeSPMAddress;
@@ -176,26 +252,38 @@ private:
   std::vector<MemoryRequest *> activeWriteRequests;
   std::queue<Window *> ongoingWindows;
   std::queue<std::pair<Window *, uint64_t>> spmRetryPackets;
-  std::map<Window *, std::vector<MemoryRequest *>> activeWindowRequests;
+  std::map<Window *, std::vector<MemoryRequest *>> activeSignalWindowRequests;
+  std::map<TimeseriesWindow *, std::vector<MemoryRequest *>>
+      activeTSWindowRequests;
 
-  MemoryRequest *writeToPort(RequestPort *port, uint64_t data,
-                             Addr destination_addr);
-  void handlePERequest(MemoryRequest *read_req, PEPort *pe_port);
-  void handleWindowMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
+  // timeseries related (for now kept separate)
+  std::vector<TimeseriesWindow *> ongoingTSWindows;
+
+  // Utility functions
+  MemoryRequest *writeToPort(RequestPort *port, uint64_t data, Addr addr);
+  MemoryRequest *readFromPort(RequestPort *port, Addr addr, size_t len);
+  void handlePESignalRequest(MemoryRequest *read_req, PEPort *pe_port);
+  void handleSignalWindowMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
+  void handleTSWindowMemoryResponse(PacketPtr pkt, MemoryRequest *req);
   void sendPEResponse(PEPort *pe_port, Addr spm_addr);
   void scheduleEvent(Tick when = 0);
   void recvPacket(PacketPtr pkt);
   bool checkPort(RequestPort *port, size_t len, bool is_read);
-  void readFromPort(RequestPort *port, Addr addr, size_t len);
   MemoryRequest *findMemRequest(PacketPtr pkt,
                                 const std::vector<MemoryRequest *> &target_vec);
   void removeMemRequest(MemoryRequest *mem_req,
                         std::vector<MemoryRequest *> &target_vec);
-  PERequest constructPERequestFromReadRequest(MemoryRequest *read_req);
+  PESignalRequest constructPERequestFromReadRequest(MemoryRequest *read_req);
   GlobalPort *getValidGlobalPort(Addr add, bool read);
   SPMPort *findAvailableSPMPort();
-  Window *findCorrespondingWindow(PacketPtr pkt);
-  void removeCorrespondingWindowRequest(MemoryRequest *mem_req);
+  Window *findCorrespondingSignalWindow(PacketPtr pkt);
+  void removeCorrespondingSignalWindowRequest(MemoryRequest *mem_req);
+  TimeseriesWindow *findCorrespondingTSWindow(PacketPtr pkt);
+  void removeCorrespondingTSWindowRequest(MemoryRequest *mem_req);
+  void signalTick();
+  void tsTick();
+  void handlePETimeseriesRequest(MemoryRequest *read_req, PEPort *pe_port);
+  uint64_t extractPERequestValue(MemoryRequest *read_req);
 
 public:
   WindowManager(const WindowManagerParams &p);

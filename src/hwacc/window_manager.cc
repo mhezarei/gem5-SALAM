@@ -17,10 +17,12 @@ WindowManager::WindowManager(const WindowManagerParams &p)
 
   peRequestLength = 8;
   dataSize = 4;
+  tsDataSize = 8;
   endToken = 0xFFFFFFFFFFFFFFFF;
 
   spmSize = 2048;
   currentFreeSPMAddress = 0x10021080;
+  coresStartAddr = 0x80C00000;
 
   mmr = new uint8_t[io_size];
   std::fill(mmr, mmr + io_size, 0);
@@ -46,10 +48,13 @@ void WindowManager::recvPacket(PacketPtr pkt) {
         delete pkt;
         return;
       }
-      handlePERequest(read_req, pe_port);
+
+      // handlePESignalRequest(read_req, pe_port);
+      handlePETimeseriesRequest(read_req, pe_port);
     } else if (GlobalPort *global_port =
                    dynamic_cast<GlobalPort *>(carrier_port)) {
-      handleWindowMemoryResponse(pkt, read_req);
+      // handleSignalWindowMemoryResponse(pkt, read_req);
+      handleTSWindowMemoryResponse(pkt, read_req);
     }
 
     removeMemRequest(read_req, activeReadRequests);
@@ -57,8 +62,9 @@ void WindowManager::recvPacket(PacketPtr pkt) {
   } else if (pkt->isWrite()) {
     MemoryRequest *write_req = findMemRequest(pkt, activeWriteRequests);
     RequestPort *carrier_port = write_req->getCarrierPort();
+
     if (SPMPort *port = dynamic_cast<SPMPort *>(carrier_port)) {
-      removeCorrespondingWindowRequest(write_req);
+      removeCorrespondingSignalWindowRequest(write_req);
       if (debug())
         DPRINTF(WindowManager, "Done with a write. addr: 0x%x, size: %d\n",
                 pkt->req->getPaddr(), pkt->getSize());
@@ -66,6 +72,11 @@ void WindowManager::recvPacket(PacketPtr pkt) {
       if (debug())
         DPRINTF(WindowManager, "Done with a write. addr: 0x%x, size: %d\n",
                 pkt->req->getPaddr(), pkt->getSize());
+    } else if (GlobalPort *port = dynamic_cast<GlobalPort *>(carrier_port)) {
+      if (debug())
+        DPRINTF(WindowManager, "Done with a write. addr: 0x%x, size: %d\n",
+                pkt->req->getPaddr(), pkt->getSize());
+      handleTSWindowMemoryResponse(pkt, write_req);
     } else {
       panic("WE ARE DROWNING!\n");
     }
@@ -80,12 +91,590 @@ void WindowManager::recvPacket(PacketPtr pkt) {
   delete pkt;
 }
 
+void WindowManager::handlePETimeseriesRequest(MemoryRequest *read_req,
+                                              PEPort *pe_port) {
+  for (auto &pair : activeTSWindowRequests) {
+    if (std::find(pair.second.begin(), pair.second.end(), read_req) !=
+        pair.second.end()) { // this was a result request from WM to PE
+      handleTSWindowMemoryResponse(read_req->getPacket(), read_req);
+      return;
+    }
+  }
+
+  uint64_t value = extractPERequestValue(read_req);
+
+  for (auto &window : ongoingTSWindows) {
+    if (window->samePEPort(pe_port)) {
+      window->setPERequest(value);
+      return;
+    }
+  }
+
+  // no previous windows matching this port was found => new port request
+  TimeseriesWindow *w = new TimeseriesWindow(this, pe_port);
+  w->setPERequest(value);
+  ongoingTSWindows.push_back(w);
+}
+
+WindowManager::TimeseriesWindow::TimeseriesWindow(WindowManager *owner,
+                                                  PEPort *pe_port)
+    : windowName("TimeseriesWindow"), owner(owner),
+      correspondingPEPort(pe_port) {
+  peRequest = (PETimeseriesRequest){UINT64_MAX, UINT64_MAX};
+  state = none;
+  currentCoreAddr = 0;
+  batchSize = 8;
+  numChildren = 4;
+  numReceivedChildren = 0;
+
+  leavesStartAddr = 0x80c00118;
+  leavesEndAddr = 0x80c00460;
+  numCheckedNodes = 0;
+}
+
+bool WindowManager::TimeseriesWindow::isLeafNode(Addr node_addr) {
+  // TODO: better leaf check logic
+  return leavesStartAddr <= node_addr && node_addr <= leavesEndAddr;
+}
+
+void WindowManager::TimeseriesWindow::firstScanTick() {
+  if (state == requestCoreStart) {
+    if (debug())
+      DPRINTF(Window, "State: requestCoreStart\n");
+
+    if (coreQueue.empty()) {
+      state = firstScanDone;
+      return;
+    }
+
+    currentCoreAddr = coreQueue.front();
+    // TODO: parameterize core element offsets
+    Addr coreRangeStart = currentCoreAddr + 0;
+
+    if (debug())
+      DPRINTF(Window, "Core Start Addr: 0x%016x\n", currentCoreAddr);
+
+    // request range start
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(coreRangeStart, true))) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, coreRangeStart, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = waitingCoreRangeStart;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, coreRangeStart);
+      currentCoreAddr = 0;
+    }
+  } else if (state == requestCoreEnd) {
+    if (debug())
+      DPRINTF(Window, "State: requestCoreEnd\n");
+
+    Addr coreRangeEnd = currentCoreAddr + owner->tsDataSize;
+
+    if (debug())
+      DPRINTF(Window, "Core End Addr: 0x%016x\n", coreRangeEnd);
+
+    // request range end
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(coreRangeEnd, true))) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, coreRangeEnd, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = waitingCoreRangeEnd;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, coreRangeEnd);
+    }
+  } else if (state == checkRange) {
+    if (debug())
+      DPRINTF(Window, "State: checkRange\n");
+
+    uint64_t inp_start = peRequest.startTimestamp;
+    uint64_t inp_end = peRequest.endTimestamp;
+    double node_start, node_end;
+    memcpy(&node_start, &currentCoreStart, sizeof(node_start));
+    memcpy(&node_end, &currentCoreEnd, sizeof(node_end));
+
+    assert(node_start < node_end);
+
+    if (debug())
+      DPRINTF(Window,
+              "Checking range inp_start:%d inp_end:%d against node_start:%f "
+              "node_end:%f\n",
+              inp_start, inp_end, node_start, node_end);
+
+    bool is_leaf = isLeafNode(currentCoreAddr);
+    bool case_skip = (node_start > inp_end || node_end < inp_start);
+    bool case_finished = (node_start == inp_start && node_end == inp_end);
+    bool case_add_to_list = (node_start >= inp_start && node_end <= inp_end);
+
+    if (case_skip) {
+      state = requestCoreStart;
+    } else if (case_finished) {
+      computationCores.push(currentCoreAddr);
+      state = done;
+    } else if (case_add_to_list) {
+      computationCores.push(currentCoreAddr);
+      state = requestCoreStart;
+    } else { // this means either leaf/partial or non-leaf/children
+      if (!is_leaf) {
+        state = requestChildAddress;
+      } else {
+        // TODO: partial leaf scan please
+        // state =
+      }
+    }
+
+    if (!coreQueue.empty())
+      coreQueue.pop();
+  } else if (state == requestChildAddress) {
+    if (debug())
+      DPRINTF(Window, "State: requestChildAddress\n");
+
+    assert(numReceivedChildren >= 0 && numReceivedChildren < numChildren);
+
+    Addr childAddress =
+        currentCoreAddr + (numReceivedChildren + 3) * owner->tsDataSize;
+
+    if (debug())
+      DPRINTF(Window,
+              "Requesting address for Child number %d which is inside address "
+              "0x%016x\n",
+              numReceivedChildren, childAddress);
+
+    // request child address
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(childAddress, true))) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, childAddress, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = waitingChildAddress;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, childAddress);
+    }
+  } else if (state == firstScanDone) {
+    state = initTraverse;
+  }
+}
+
+void WindowManager::TimeseriesWindow::traverseTick() {
+  if (state == initTraverse) {
+    if (debug())
+      DPRINTF(Window, "State: initTraverse\n");
+
+    if (computationCores.empty()) {
+      if (debug())
+        DPRINTF(Window, "We are done DONE!\n");
+
+      state = done;
+      return;
+    }
+
+    DPRINTF(Window, "Going over this computation core: 0x%016x\n",
+            computationCores.front());
+    traverseStack.push(std::make_pair(computationCores.front(), false));
+    computationCores.pop();
+    state = requestStat;
+  } else if (state == requestStat) {
+    if (debug())
+      DPRINTF(Window, "State: requestStat\n");
+
+    if (traverseStack.top()
+            .second) { // visited nodes do not need initial stat check
+      if (debug())
+        DPRINTF(Window, "no need for stat check\n");
+
+      state = startTraverse;
+      return;
+    }
+
+    Addr statAddr = traverseStack.top().first + 2 * owner->tsDataSize;
+
+    if (debug())
+      DPRINTF(Window, "I want stat addr: 0x%016x\n", statAddr);
+
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(statAddr, true))) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, statAddr, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = waitingStat;
+      numCheckedNodes++;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, statAddr);
+    }
+  } else if (state == startTraverse) {
+    if (debug())
+      DPRINTF(Window, "State: startTraverse\n");
+
+    traverseStackHead = traverseStack.top();
+
+    if (debug())
+      DPRINTF(Window, "Head addr and visited: 0x%016x, %d\n",
+              traverseStackHead.first, traverseStackHead.second);
+
+    if (!traverseStackHead.second) { // not visited -> add children if not leaf
+      traverseStack.top().second = true;
+
+      if (isLeafNode(traverseStackHead.first)) { // is leaf -> nothing special
+        state = startTraverse;
+      } else { // is not leaf -> add children to stack
+        state = requestTraverseChildren;
+      }
+    } else { // visited -> comp stat -> pop
+      state = computeStat;
+    }
+  } else if (state == requestTraverseChildren) {
+    if (debug())
+      DPRINTF(Window, "State: requestTraverseChildren\n");
+
+    assert(numReceivedChildren >= 0 && numReceivedChildren < numChildren);
+
+    // adding to stack from end to beginning
+    Addr childAddress =
+        traverseStackHead.first +
+        ((numChildren - numReceivedChildren - 1) + 3) * owner->tsDataSize;
+
+    if (debug())
+      DPRINTF(Window,
+              "Requesting address for Child number %d which is inside address "
+              "0x%016x\n",
+              numReceivedChildren, childAddress);
+
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(childAddress, true))) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, childAddress, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = waitingTraverseChildren;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, childAddress);
+    }
+  } else if (state == computeStat) {
+    if (debug())
+      DPRINTF(Window, "State: computeStat\n");
+
+    openPEPort = findPEPortForComputeState();
+    Addr port_addr = openPEPort->getStartAddress();
+
+    if (isLeafNode(traverseStackHead.first)) { // leaf node
+      MemoryRequest *write_req =
+          owner->writeToPort(openPEPort, (uint64_t)1, port_addr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+
+      write_req = owner->writeToPort(
+          openPEPort, (uint64_t)(batchSize * numChildren), port_addr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+
+      state = computeStat_RequestLeafChildrenStartAddress;
+    } else { // non-leaf node
+      MemoryRequest *write_req =
+          owner->writeToPort(openPEPort, (uint64_t)2, port_addr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+
+      write_req =
+          owner->writeToPort(openPEPort, (uint64_t)numChildren, port_addr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+
+      state = computeStat_RequestCoreChildren;
+    }
+  } else if (state == computeStat_RequestLeafChildrenStartAddress) {
+    if (debug())
+      DPRINTF(Window, "State: computeStat_RequestLeafChildrenStartAddress\n");
+
+    // TODO: leaf's children might not be sequential
+    // TODO: fix reversed order
+    Addr childStartAddress = traverseStackHead.first + 3 * owner->tsDataSize;
+
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(childStartAddress, true))) {
+      MemoryRequest *read_req = owner->readFromPort(
+          memory_port, childStartAddress, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = computeStat_WaitingLeafChildStartAddress;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, childStartAddress);
+    }
+  } else if (state == computeStat_RequestCoreChildren) {
+    if (debug())
+      DPRINTF(Window, "State: computeStat_RequestCoreChildren\n");
+
+    Addr childStartAddress =
+        traverseStackHead.first + (numReceivedChildren + 3) * owner->tsDataSize;
+
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(childStartAddress, true))) {
+      MemoryRequest *read_req = owner->readFromPort(
+          memory_port, childStartAddress, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+
+      state = computeStat_WaitingCoreChildren;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, childStartAddress);
+    }
+  } else if (state == computeStat_RequestCoreChildStat) {
+    if (debug())
+      DPRINTF(Window, "State: computeStat_RequestCoreChildStat\n");
+
+    Addr childStatAddress = currentCoreChildAddress + 2 * owner->tsDataSize;
+
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(childStatAddress, true))) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, childStatAddress, owner->tsDataSize);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = computeStat_WaitingCoreChildStat;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, childStatAddress);
+    }
+  } else if (state == computeStat_RequestResult) {
+    if (debug())
+      DPRINTF(Window, "State: computeStat_RequestResult\n");
+
+    assert(openPEPort != nullptr);
+    int port_idx = std::distance(owner->peResponseStreamPorts.begin(),
+                                 std::find(owner->peResponseStreamPorts.begin(),
+                                           owner->peResponseStreamPorts.end(),
+                                           openPEPort));
+    assert(port_idx < owner->peRequestStreamPorts.size());
+    PEPort *pe_req_port = owner->peRequestStreamPorts[port_idx];
+    assert(pe_req_port != nullptr);
+    if (owner->checkPort(pe_req_port, owner->peRequestLength, true)) {
+      MemoryRequest *read_req = owner->readFromPort(
+          pe_req_port, pe_req_port->getStartAddress(), owner->peRequestLength);
+      owner->activeTSWindowRequests[this].push_back(read_req);
+      state = computeStat_WaitingResult;
+    }
+  } else if (state == computeStat_SaveResult) {
+    if (debug())
+      DPRINTF(Window, "State: computeStat_SaveResult\n");
+
+    Addr currentCoreStatAddr = traverseStackHead.first + 2 * owner->tsDataSize;
+
+    if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
+            owner->getValidGlobalPort(currentCoreStatAddr, true))) {
+      MemoryRequest *write_req =
+          owner->writeToPort(memory_port, computedResult, currentCoreStatAddr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+      state = computeStat_WaitingSaveResult;
+    } else {
+      if (debug())
+        DPRINTF(Window,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, currentCoreStatAddr);
+    }
+  } else if (state == done) {
+    if (debug())
+      DPRINTF(Window, "State: done with %d results\n", endResults.size());
+
+    uint64_t result = 0;
+    for (auto val : endResults)
+      result += val;
+    result /= endResults.size();
+
+    DPRINTF(Window, "END RESULT IS 0x%016x\n", result);
+  }
+}
+
+void WindowManager::TimeseriesWindow::handleResponseData(uint64_t data) {
+  if (state == waitingCoreRangeStart) {
+    if (debug())
+      DPRINTF(Window, "State: waitingCoreRangeStart; the start is 0x%016x\n",
+              data);
+
+    currentCoreStart = data;
+    state = requestCoreEnd;
+  } else if (state == waitingCoreRangeEnd) {
+    if (debug())
+      DPRINTF(Window, "State: waitingCoreRangeEnd; the end is 0x%016x\n", data);
+
+    currentCoreEnd = data;
+    state = checkRange;
+  } else if (state == waitingChildAddress) {
+    if (debug())
+      DPRINTF(Window,
+              "State: waitingChildAddress; the child address is 0x%016x\n",
+              data);
+
+    coreQueue.push(data);
+    numReceivedChildren++;
+    if (numReceivedChildren == numChildren) {
+      state = requestCoreStart;
+      numReceivedChildren = 0;
+    } else {
+      state = requestChildAddress;
+    }
+  } else if (state == waitingStat) {
+    if (debug())
+      DPRINTF(Window, "State: waitingStat; the stat is 0x%016x\n", data);
+
+    if (data == 0) {
+      state = startTraverse;
+    } else { // stat is present.
+      traverseStack.pop();
+
+      // root has stat
+      if (numCheckedNodes == 1) {
+        numCheckedNodes = 0;
+        state = initTraverse;
+      }
+      // non-root has stat
+      if (numCheckedNodes > 1) {
+        state = requestStat;
+      }
+    }
+  } else if (state == waitingTraverseChildren) {
+    if (debug())
+      DPRINTF(Window,
+              "State: waitingTraverseChildren; the child address is 0x%016x\n",
+              data);
+
+    numReceivedChildren++;
+    traverseStack.push(std::make_pair(data, false));
+    if (numReceivedChildren == numChildren) {
+      state = requestStat;
+      numReceivedChildren = 0;
+    } else {
+      state = requestTraverseChildren;
+    }
+  } else if (state == computeStat_WaitingLeafChildStartAddress) {
+    if (debug())
+      DPRINTF(Window,
+              "State: computeStat_WaitingLeafChildStartAddress; the child "
+              "address is 0x%016x\n",
+              data);
+
+    assert(openPEPort != nullptr);
+    MemoryRequest *write_req =
+        owner->writeToPort(openPEPort, data, openPEPort->getStartAddress());
+    owner->activeTSWindowRequests[this].push_back(write_req);
+    state = computeStat_RequestResult;
+  } else if (state == computeStat_WaitingCoreChildren) {
+    if (debug())
+      DPRINTF(Window,
+              "State: computeStat_WaitingCoreChildren; the child address is "
+              "0x%016x\n",
+              data);
+
+    currentCoreChildAddress = data;
+    numReceivedChildren++;
+    state = computeStat_RequestCoreChildStat;
+  } else if (state == computeStat_WaitingCoreChildStat) {
+    if (debug())
+      DPRINTF(Window,
+              "State: computeStat_WaitingCoreChildStat; the child stat is "
+              "0x%016x\n",
+              data);
+
+    assert(openPEPort != nullptr);
+    MemoryRequest *write_req =
+        owner->writeToPort(openPEPort, data, openPEPort->getStartAddress());
+    owner->activeTSWindowRequests[this].push_back(write_req);
+
+    if (numReceivedChildren == numChildren) {
+      numReceivedChildren = 0;
+      state = computeStat_RequestResult;
+    } else {
+      state = computeStat_RequestCoreChildren;
+    }
+  } else if (state == computeStat_WaitingResult) {
+    if (debug())
+      DPRINTF(Window,
+              "State: computeStat_WaitingResult; the result from PE is "
+              "0x%016x\n",
+              data);
+
+    computedResult = data;
+    state = computeStat_SaveResult;
+  } else if (state == computeStat_WaitingSaveResult) {
+    if (debug())
+      DPRINTF(Window, "State: computeStat_WaitingSaveResult;\n");
+
+    traverseStack.pop();
+    if (traverseStack.empty()) { // done for this computation core
+      numCheckedNodes = 0;
+      state = initTraverse;
+      endResults.push_back(computedResult);
+    } else {
+      computedResult = 0;
+      state = requestStat;
+    }
+  }
+}
+
+void WindowManager::tsTick() {
+  // turn off
+  // if (ongoingTSWindows.empty()) {
+  //   *mmr &= 0xfc;
+  //   *mmr |= 0x04;
+  //   return;
+  // }
+
+  // read from PEs (start, end)
+  for (PEPort *port : peRequestStreamPorts) {
+    if (port != peRequestStreamPorts[0] &&
+        checkPort(port, peRequestLength, true)) {
+      readFromPort(port, port->getStartAddress(), peRequestLength);
+    }
+  }
+
+  // clear out done windows
+  // for (auto it = ongoingTSWindows.begin(); it != ongoingTSWindows.end();
+  // ++it) {
+  //   if ((*it)->isDone()) {
+  //     ongoingTSWindows.erase(it);
+  //   }
+  // }
+
+  // advance timeseries windows by one
+  for (auto &w : ongoingTSWindows) {
+    w->firstScanTick();
+    w->traverseTick();
+  }
+}
+
 void WindowManager::tick() {
   if (debug())
     DPRINTF(WindowManager, "Tick!\n");
 
+  // for (auto &p : peResponseStreamPorts)
+  //   DPRINTF(WindowManager, "THROBBING RESP 0x%016x\n", p->getStartAddress());
+  // for (auto &p : peRequestStreamPorts)
+  //   DPRINTF(WindowManager, "THROBBING REQ 0x%016x\n", p->getStartAddress());
+
+  // signalTick();
+  tsTick();
+
+  // Schedule the next tick if needed
+  scheduleEvent();
+}
+
+void WindowManager::signalTick() {
   // turning off condition
-  if (activeWindowRequests.empty() &&
+  if (activeSignalWindowRequests.empty() &&
       finishedPEs.size() == peRequestStreamPorts.size()) {
     *mmr &= 0xfc;
     *mmr |= 0x04;
@@ -100,15 +689,15 @@ void WindowManager::tick() {
   }
 
   // remove windows without any requests
-  for (auto it = activeWindowRequests.begin(); it != activeWindowRequests.end();
-       it++)
+  for (auto it = activeSignalWindowRequests.begin();
+       it != activeSignalWindowRequests.end(); it++)
     if (it->second.empty()) {
       // respond to the corresponding PE
       Window *window = it->first;
       sendPEResponse(window->getCorrespondingPEPort(),
                      window->getSPMBaseAddr());
 
-      activeWindowRequests.erase(it);
+      activeSignalWindowRequests.erase(it);
     }
 
   // check the single ongoing Window (head of the queue)
@@ -130,15 +719,38 @@ void WindowManager::tick() {
     window->sendSPMRequest(data);
     spmRetryPackets.pop();
   }
-
-  // Schedule the next tick if needed
-  scheduleEvent();
 }
 
 /* Utility functions start */
-void WindowManager::handlePERequest(MemoryRequest *read_req, PEPort *pe_port) {
+WindowManager::PEPort *
+WindowManager::TimeseriesWindow::findPEPortForComputeState() {
+  // TODO: write complete PE response port finding and sending
+  return owner->peResponseStreamPorts[0];
+}
+
+void WindowManager::handleTSWindowMemoryResponse(PacketPtr pkt,
+                                                 MemoryRequest *req) {
+  TimeseriesWindow *window = findCorrespondingTSWindow(pkt);
+  uint64_t data = *((uint64_t *)req->getBuffer());
+  window->handleResponseData(data);
+  removeCorrespondingTSWindowRequest(req);
+}
+
+void WindowManager::TimeseriesWindow::setPERequest(uint64_t value) {
+  if (peRequest.startTimestamp == UINT64_MAX)
+    peRequest.startTimestamp = value;
+  else if (peRequest.endTimestamp == UINT64_MAX) {
+    peRequest.endTimestamp = value;
+    coreQueue.push(owner->coresStartAddr);
+    state = requestCoreStart;
+  } else
+    panic("Calling setPERequest when you should not!\n");
+}
+
+void WindowManager::handlePESignalRequest(MemoryRequest *read_req,
+                                          PEPort *pe_port) {
   // Necessary steps for window creation
-  PERequest pe_req = constructPERequestFromReadRequest(read_req);
+  PESignalRequest pe_req = constructPERequestFromReadRequest(read_req);
   Addr base_addr = pe_req.sourceAddr;
   std::vector<Offset> offsets;
   for (uint16_t idx = pe_req.startElement;
@@ -153,19 +765,20 @@ void WindowManager::handlePERequest(MemoryRequest *read_req, PEPort *pe_port) {
   currentFreeSPMAddress += pe_req.length * dataSize;
 }
 
-void WindowManager::handleWindowMemoryResponse(PacketPtr pkt,
-                                               MemoryRequest *read_req) {
-  Window *window = findCorrespondingWindow(pkt);
+void WindowManager::handleSignalWindowMemoryResponse(PacketPtr pkt,
+                                                     MemoryRequest *read_req) {
+  Window *window = findCorrespondingSignalWindow(pkt);
   uint64_t data = *((uint64_t *)read_req->getBuffer());
 
   if (!window->sendSPMRequest(data)) {
     spmRetryPackets.push(std::make_pair(window, data));
   }
 
-  removeCorrespondingWindowRequest(read_req);
+  removeCorrespondingSignalWindowRequest(read_req);
 }
 
-void WindowManager::readFromPort(RequestPort *port, Addr addr, size_t len) {
+MemoryRequest *WindowManager::readFromPort(RequestPort *port, Addr addr,
+                                           size_t len) {
   MemoryRequest *read_req = new MemoryRequest(addr, len);
   Request::Flags flags;
   RequestPtr req = std::make_shared<Request>(addr, len, flags, masterId);
@@ -178,6 +791,11 @@ void WindowManager::readFromPort(RequestPort *port, Addr addr, size_t len) {
   if (PEPort *pe_port = dynamic_cast<PEPort *>(port)) {
     pe_port->sendPacket(pkt);
     activeReadRequests.push_back(read_req);
+  } else if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(port)) {
+    memory_port->sendPacket(pkt);
+    activeReadRequests.push_back(read_req);
+  } else {
+    panic("sending port is not suitable for reading");
   }
 
   if (debug())
@@ -186,16 +804,20 @@ void WindowManager::readFromPort(RequestPort *port, Addr addr, size_t len) {
             len, port->name());
 
   scheduleEvent();
+  return read_req;
 }
 
 MemoryRequest *WindowManager::writeToPort(RequestPort *req_port, uint64_t input,
                                           Addr addr) {
+  size_t data_size =
+      tsDataSize; // TODO: fix variable data size for TS and signal
+
   MemoryRequest *write_req =
-      new MemoryRequest(addr, (uint8_t *)&input, dataSize);
+      new MemoryRequest(addr, (uint8_t *)&input, data_size);
   Request::Flags flags;
-  RequestPtr req = std::make_shared<Request>(addr, dataSize, flags, masterId);
-  uint8_t *data = new uint8_t[dataSize];
-  std::memcpy(data, write_req->getBuffer(), dataSize);
+  RequestPtr req = std::make_shared<Request>(addr, data_size, flags, masterId);
+  uint8_t *data = new uint8_t[data_size];
+  std::memcpy(data, write_req->getBuffer(), data_size);
   req->setExtraData((uint64_t)data);
   write_req->setCarrierPort(req_port);
 
@@ -204,7 +826,7 @@ MemoryRequest *WindowManager::writeToPort(RequestPort *req_port, uint64_t input,
         WindowManager,
         "Trying to write to addr: 0x%016x, %d bytes, holding 0x%016x value, "
         "through port: %s\n",
-        addr, dataSize, *((uint64_t *)write_req->getBuffer()),
+        addr, data_size, *((uint64_t *)write_req->getBuffer()),
         req_port->name());
 
   PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
@@ -214,8 +836,13 @@ MemoryRequest *WindowManager::writeToPort(RequestPort *req_port, uint64_t input,
 
   if (PEPort *port = dynamic_cast<PEPort *>(req_port)) {
     port->sendPacket(pkt);
+    activeWriteRequests.push_back(write_req);
   } else if (SPMPort *port = dynamic_cast<SPMPort *>(req_port)) {
     port->sendPacket(pkt);
+    activeWriteRequests.push_back(write_req);
+  } else if (GlobalPort *port = dynamic_cast<GlobalPort *>(req_port)) {
+    port->sendPacket(pkt);
+    activeWriteRequests.push_back(write_req);
   } else {
     panic("sending port is not suitable for writing");
   }
@@ -233,10 +860,7 @@ void WindowManager::sendPEResponse(PEPort *req_pe_port, Addr spm_addr) {
   PEPort *pe_resp_port = peResponseStreamPorts[port_idx];
   Addr destination_addr = pe_resp_port->getStartAddress();
 
-  MemoryRequest *write_req =
-      writeToPort(pe_resp_port, spm_addr, destination_addr);
-
-  activeWriteRequests.push_back(write_req);
+  writeToPort(pe_resp_port, spm_addr, destination_addr);
 }
 
 Tick WindowManager::read(PacketPtr pkt) {
@@ -311,25 +935,31 @@ WindowManager::SPMPort *WindowManager::findAvailableSPMPort() {
   return nullptr;
 }
 
-WindowManager::PERequest
-WindowManager::constructPERequestFromReadRequest(MemoryRequest *read_req) {
+uint64_t WindowManager::extractPERequestValue(MemoryRequest *read_req) {
   size_t read_len = read_req->getLength();
-  if (read_len == 8) { // 8 bytes
+  if (read_len == peRequestLength) { // 8 bytes
     assert(read_req->getTotalLength() == (Tick)read_len);
 
     uint64_t result = 0;
     for (int i = read_req->getTotalLength() - 1; i >= 0; i--)
       result = (result << 8) + read_req->getBuffer()[i];
 
-    uint32_t source_addr = result >> 32;
-    uint16_t start_element = (result >> 16) & 0x000000000000FFFF;
-    uint16_t length = result & 0x000000000000FFFF;
-
-    return (PERequest){source_addr, start_element, length};
+    return result;
   }
 
   panic("Can't handle read lengths other than 8 for now!\n");
-  return (PERequest){0, 0, 0};
+  return 0;
+}
+
+WindowManager::PESignalRequest
+WindowManager::constructPERequestFromReadRequest(MemoryRequest *read_req) {
+  uint64_t result = extractPERequestValue(read_req);
+
+  uint32_t source_addr = result >> 32;
+  uint16_t start_element = (result >> 16) & 0x000000000000FFFF;
+  uint16_t length = result & 0x000000000000FFFF;
+
+  return (PESignalRequest){source_addr, start_element, length};
 }
 
 void WindowManager::scheduleEvent(Tick when) {
@@ -421,6 +1051,8 @@ std::string WindowManager::PEPort::getPENameFromPeerPort() {
 bool WindowManager::checkPort(RequestPort *port, size_t len, bool is_read) {
   if (PEPort *pePort = dynamic_cast<PEPort *>(port))
     return pePort->streamValid(len, is_read);
+  else
+    panic("currently no support for validation check other than PE port\n");
 
   return false;
 }
@@ -512,8 +1144,9 @@ void WindowManager::removeMemRequest(MemoryRequest *mem_req,
   //           removal)\n");
 }
 
-WindowManager::Window *WindowManager::findCorrespondingWindow(PacketPtr pkt) {
-  for (const auto &elem : activeWindowRequests)
+WindowManager::Window *
+WindowManager::findCorrespondingSignalWindow(PacketPtr pkt) {
+  for (const auto &elem : activeSignalWindowRequests)
     for (const auto &req : elem.second)
       if (req->getPacket() == pkt)
         return elem.first;
@@ -522,15 +1155,42 @@ WindowManager::Window *WindowManager::findCorrespondingWindow(PacketPtr pkt) {
   return nullptr;
 }
 
-void WindowManager::removeCorrespondingWindowRequest(MemoryRequest *mem_req) {
+void WindowManager::removeCorrespondingSignalWindowRequest(
+    MemoryRequest *mem_req) {
   if (debug())
     DPRINTF(WindowManager, "Clearing Request with addr 0x%016x\n",
             mem_req->getAddress());
 
-  for (const auto &elem : activeWindowRequests) {
+  for (const auto &elem : activeSignalWindowRequests) {
     for (auto it = elem.second.begin(); it != elem.second.end(); ++it) {
       if (*it == mem_req) {
-        activeWindowRequests[elem.first].erase(it);
+        activeSignalWindowRequests[elem.first].erase(it);
+        break;
+      }
+    }
+  }
+}
+
+WindowManager::TimeseriesWindow *
+WindowManager::findCorrespondingTSWindow(PacketPtr pkt) {
+  for (const auto &elem : activeTSWindowRequests)
+    for (const auto &req : elem.second)
+      if (req->getPacket() == pkt)
+        return elem.first;
+
+  panic("Could not find memory request in active window requests map\n");
+  return nullptr;
+}
+
+void WindowManager::removeCorrespondingTSWindowRequest(MemoryRequest *mem_req) {
+  if (debug())
+    DPRINTF(WindowManager, "Clearing Request with addr 0x%016x\n",
+            mem_req->getAddress());
+
+  for (const auto &elem : activeTSWindowRequests) {
+    for (auto it = elem.second.begin(); it != elem.second.end(); ++it) {
+      if (*it == mem_req) {
+        activeTSWindowRequests[elem.first].erase(it);
         break;
       }
     }
@@ -582,7 +1242,7 @@ bool WindowManager::Window::sendMemoryRequest() {
     memory_port->sendPacket(read_req->getPacket());
 
     owner->activeReadRequests.push_back(read_req);
-    owner->activeWindowRequests[this].push_back(read_req);
+    owner->activeSignalWindowRequests[this].push_back(read_req);
     memoryRequests.pop();
   } else {
     if (debug())
@@ -602,9 +1262,7 @@ bool WindowManager::Window::sendSPMRequest(uint64_t data) {
     return false;
 
   MemoryRequest *write_req = owner->writeToPort(spm_port, data, addr);
-
-  owner->activeWriteRequests.push_back(write_req);
-  owner->activeWindowRequests[this].push_back(write_req);
+  owner->activeSignalWindowRequests[this].push_back(write_req);
 
   currentSPMOffset += owner->dataSize;
   return true;
