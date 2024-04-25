@@ -151,6 +151,7 @@ private:
     PETimeseriesRequest peRequest;
     PEPort *correspondingPEPort;
     std::queue<Addr> computationCores;
+    std::queue<std::pair<Addr, uint64_t>> partials;
     std::queue<Addr> coreQueue;
     int batchSize;
     int numChildren;
@@ -159,6 +160,7 @@ private:
     uint64_t currentCoreStart, currentCoreEnd;
 
     // traversal info
+    std::pair<Addr, uint64_t>> currentPartial;
     std::stack<std::pair<Addr, bool>> traverseStack;
     std::vector<uint64_t> endResults;
     Addr leavesStartAddr, leavesEndAddr;
@@ -181,6 +183,7 @@ private:
     bool isDone() { return state == done; }
     PEPort *findPEPortForComputeState();
     bool isLeafNode(Addr node_addr);
+    bool coresDone() {return traverseStack.empty() && computationCores.empty() && travereStackHead == nullptr;}
   };
 
   class Window {

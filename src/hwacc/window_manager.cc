@@ -226,7 +226,9 @@ void WindowManager::TimeseriesWindow::firstScanTick() {
         state = requestChildAddress;
       } else {
         // TODO: partial leaf scan please
-        // state =
+        Addr partial_start_addr = max(inp_start, node_start);
+        uint64_t partial_length = abs(partial_start_addr - min(inp_end, node_end));
+        partials.push(std::make_pair(partial_start_addr, partial_length));
       }
     }
 
@@ -272,17 +274,27 @@ void WindowManager::TimeseriesWindow::traverseTick() {
 
     if (computationCores.empty()) {
       if (debug())
-        DPRINTF(Window, "We are done DONE!\n");
+        DPRINTF(Window, "Computation cores are done!\n");
 
-      state = done;
-      return;
-    }
+      if (partials.empty()) {
+        if (debug())
+          DPRTINF(Window, "We are done!\n");
+        state = done;
+        return;
+      } else {
+        assert(coresDone());
 
-    DPRINTF(Window, "Going over this computation core: 0x%016x\n",
+        currentPartial = partials.front();
+        partials.pop();
+        state = computeStat;
+      }
+    } else {
+      DPRINTF(Window, "Going over this computation core: 0x%016x\n",
             computationCores.front());
-    traverseStack.push(std::make_pair(computationCores.front(), false));
-    computationCores.pop();
-    state = requestStat;
+      traverseStack.push(std::make_pair(computationCores.front(), false));
+      computationCores.pop();
+      state = requestStat;
+    }
   } else if (state == requestStat) {
     if (debug())
       DPRINTF(Window, "State: requestStat\n");
@@ -371,7 +383,19 @@ void WindowManager::TimeseriesWindow::traverseTick() {
     openPEPort = findPEPortForComputeState();
     Addr port_addr = openPEPort->getStartAddress();
 
-    if (isLeafNode(traverseStackHead.first)) { // leaf node
+    if (coresDone() && currentPartial) { // partial calc
+      MemoryRequest *write_req =
+          owner->writeToPort(openPEPort, (uint64_t)1, port_addr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+
+      write_req = owner->writeToPort(openPEPort, currentPartial.second, port_addr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+
+      write_req = owner->writeToPort(openPEPort, currentPartial.first, port_addr);
+      owner->activeTSWindowRequests[this].push_back(write_req);
+
+      state = computeStat_RequestResult;
+    } else if (isLeafNode(traverseStackHead.first)) { // leaf node
       MemoryRequest *write_req =
           owner->writeToPort(openPEPort, (uint64_t)1, port_addr);
       owner->activeTSWindowRequests[this].push_back(write_req);
@@ -499,6 +523,19 @@ void WindowManager::TimeseriesWindow::traverseTick() {
   }
 }
 
+/*
+  mapper {maps <node addr, level> -> cache addr}
+  
+  nodeAddrAccessCounter
+    if count >= 3: replace a low level node in counter, mapper, and cache;
+  
+  when going over each core, check mapper
+    if found: request stat from cache; save to endResults;
+    else: 
+      if cache.has_space(): add to cache; add to counter; add to mapper;
+      else: check counter; continue as usual;
+*/
+
 void WindowManager::TimeseriesWindow::handleResponseData(uint64_t data) {
   if (state == waitingCoreRangeStart) {
     if (debug())
@@ -608,7 +645,14 @@ void WindowManager::TimeseriesWindow::handleResponseData(uint64_t data) {
               data);
 
     computedResult = data;
-    state = computeStat_SaveResult;
+    
+    if (coresDone()) {
+      endResults.push_back(computedResult);
+      currentPartial = nullptr;
+      state = initTraverse;
+    } else {
+      state = computeStat_SaveResult;
+    }
   } else if (state == computeStat_WaitingSaveResult) {
     if (debug())
       DPRINTF(Window, "State: computeStat_WaitingSaveResult;\n");
@@ -618,6 +662,7 @@ void WindowManager::TimeseriesWindow::handleResponseData(uint64_t data) {
       numCheckedNodes = 0;
       state = initTraverse;
       endResults.push_back(computedResult);
+      traverseStackHead = nullptr;
     } else {
       computedResult = 0;
       state = requestStat;
