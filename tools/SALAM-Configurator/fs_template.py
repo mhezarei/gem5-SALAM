@@ -139,6 +139,13 @@ def build_test_system(np):
     elif args.kernel is not None:
         test_sys.workload.object_file = binary(args.kernel)
 
+        bench_suffix = "64MB" # 8KB, 64MB, 1GB
+        cores_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"cores_{bench_suffix}.bin"
+        values_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"values_{bench_suffix}.bin"
+        cores_size = os.path.getsize(cores_path)
+        test_sys.workload.extras = [cores_path, values_path]
+        test_sys.workload.extras_addrs = [0x80c00000, 0x80c00000 + cores_size]
+
         # load = "_1000"
         # ii_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"ii{load}.bin"
         # abp_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"abp{load}.bin"

@@ -89,7 +89,6 @@ if env['TARGET_ISA'] == 'arm':
     DebugFlag('Trace')
     DebugFlag('Step')
     DebugFlag('WindowManager')
-    DebugFlag('Window')
 
     #
     CompoundFlag('JDEV', ['LLVMInterface','CommInterface', 'Runtime', 'RuntimeCompute', 'RuntimeQueues', 'SALAM_Debug'])
