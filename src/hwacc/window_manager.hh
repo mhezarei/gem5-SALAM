@@ -240,8 +240,8 @@ private:
     Addr saveCacheCoreAddr;
     Addr saveCacheEntryStat;
     Addr checkCacheCoreAddr;
-    Tick minAccessTick;
-    size_t minAccessTickIndex;
+    Tick minCacheEntryAccessTick;
+    size_t minCacheEntryIndex;
 
   public:
     TimeseriesWindow(WindowManager *owner, PEPort *pe_port);

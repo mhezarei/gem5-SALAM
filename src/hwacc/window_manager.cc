@@ -98,8 +98,8 @@ WindowManager::TimeseriesWindow::TimeseriesWindow(WindowManager *owner,
       correspondingPEPort(pe_port), numReceivedChildren(0), currentCoreAddr(0),
       currentComputationCoreAddr(0), numCheckedNodes(0),
       maxCacheIndex((size_t)(owner->spmSize / cacheEntrySize - 1)),
-      saveCacheCoreAddr(0), checkCacheCoreAddr(0), minAccessTick(UINT64_MAX),
-      minAccessTickIndex(0) {
+      saveCacheCoreAddr(0), checkCacheCoreAddr(0),
+      minCacheEntryAccessTick(UINT64_MAX), minCacheEntryIndex(0) {
   if (debug())
     DPRINTF(WindowManager, "maxCacheIndex %d\n", maxCacheIndex);
 }
@@ -768,12 +768,12 @@ void WindowManager::TimeseriesWindow::traverseTick() {
       DPRINTF(WindowManager, "State: saveCache_Replace\n");
 
     Addr cache_entry_meta_info_addr =
-        owner->spmAddr + minAccessTickIndex * cacheEntrySize;
+        owner->spmAddr + minCacheEntryIndex * cacheEntrySize;
     Addr cache_entry_hash_addr = owner->spmAddr +
-                                 minAccessTickIndex * cacheEntrySize +
+                                 minCacheEntryIndex * cacheEntrySize +
                                  owner->tsDataSize;
     Addr cache_entry_stat_addr =
-        owner->spmAddr + minAccessTickIndex * cacheEntrySize + coreStatOffset;
+        owner->spmAddr + minCacheEntryIndex * cacheEntrySize + coreStatOffset;
 
     if (SPMPort *spm_port =
             owner->getValidSPMPort(cache_entry_meta_info_addr, false)) {
@@ -790,8 +790,8 @@ void WindowManager::TimeseriesWindow::traverseTick() {
       owner->activeTimeseriesWindowRequests[this].push_back(write_req);
 
       currentComputationCoreAddr = 0;
-      minAccessTick = UINT64_MAX;
-      minAccessTickIndex = -1;
+      minCacheEntryAccessTick = UINT64_MAX;
+      minCacheEntryIndex = -1;
       saveCacheCoreAddr = 0;
 
       state = initTraverse;
@@ -1126,9 +1126,9 @@ void WindowManager::TimeseriesWindow::handleMemoryResponseData(uint64_t data) {
       if (currentCacheEntryIndex == maxCacheIndex - 1) {
         state = saveCache_Replace;
       } else {
-        if (fmin(data, minAccessTick) <= minAccessTick) {
-          minAccessTick = fmin(data, minAccessTick);
-          minAccessTickIndex = currentCacheEntryIndex;
+        if (fmin(data, minCacheEntryAccessTick) <= minCacheEntryAccessTick) {
+          minCacheEntryAccessTick = fmin(data, minCacheEntryAccessTick);
+          minCacheEntryIndex = currentCacheEntryIndex;
         }
         currentCacheEntryIndex++;
         state = saveCache_RequestEmptyEntry;
