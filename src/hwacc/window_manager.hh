@@ -358,7 +358,7 @@ private:
   bool allTimeseriesWindowsDone() {
     return std::all_of(activeTimeseriesWindows.begin(),
                        activeTimeseriesWindows.end(),
-                       [](auto &w) { return !w->isDone(); });
+                       [](auto &w) { return w->isDone(); });
   }
 
 public:
