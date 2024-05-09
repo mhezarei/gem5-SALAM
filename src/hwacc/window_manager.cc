@@ -201,7 +201,7 @@ void WindowManager::TimeseriesWindow::firstScanTick() {
 
         Addr partial_start_addr =
             currentCoreAddr +
-            ((uint64_t)(partial_start - node_start)) * 2 * owner->tsDataSize;
+            ((uint64_t)(partial_start - node_start)) * coreStatOffset;
         uint64_t partial_length = (uint64_t)partial_diff;
 
         if (debug())
@@ -372,7 +372,7 @@ void WindowManager::TimeseriesWindow::traverseTick() {
 
     Addr cache_entry_result_addr = owner->spmAddr +
                                    currentCacheEntryIndex * cacheEntrySize +
-                                   2 * owner->tsDataSize;
+                                   coreStatOffset;
 
     if (SPMPort *spm_port = owner->getValidSPMPort(cache_entry_result_addr)) {
       MemoryRequest *read_req = owner->readFromPort(
@@ -440,7 +440,7 @@ void WindowManager::TimeseriesWindow::traverseTick() {
       return;
     }
 
-    Addr statAddr = traverseStack.top().first + 2 * owner->tsDataSize;
+    Addr statAddr = traverseStack.top().first + coreStatOffset;
 
     if (debug())
       DPRINTF(WindowManager, "stat addr: 0x%016x\n", statAddr);
@@ -547,7 +547,7 @@ void WindowManager::TimeseriesWindow::traverseTick() {
           openPEPort, (uint64_t)(batchSize * numChildren), port_addr);
       owner->activeTimeseriesWindowRequests[this].push_back(write_req);
 
-      state = computeStat_RequestLeafChildrenStartAddr;
+      state = computeStat_RequestLeafValuesStartAddr;
     } else { // non-leaf node
       if (debug())
         DPRINTF(WindowManager, "calculating core node\n");
@@ -560,12 +560,11 @@ void WindowManager::TimeseriesWindow::traverseTick() {
           owner->writeToPort(openPEPort, (uint64_t)numChildren, port_addr);
       owner->activeTimeseriesWindowRequests[this].push_back(write_req);
 
-      state = computeStat_RequestCoreChildren;
+      state = computeStat_RequestCoreChildAddr;
     }
-  } else if (state == computeStat_RequestLeafChildrenStartAddr) {
+  } else if (state == computeStat_RequestLeafValuesStartAddr) {
     if (debug())
-      DPRINTF(WindowManager,
-              "State: computeStat_RequestLeafChildrenStartAddr\n");
+      DPRINTF(WindowManager, "State: computeStat_RequestLeafValuesStartAddr\n");
 
     // TODO: leaf's children might not be sequential
     Addr childStartAddr = traverseStackHead.first + 3 * owner->tsDataSize;
@@ -575,16 +574,16 @@ void WindowManager::TimeseriesWindow::traverseTick() {
       MemoryRequest *read_req =
           owner->readFromPort(memory_port, childStartAddr, owner->tsDataSize);
       owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = computeStat_WaitingLeafChildStartAddr;
+      state = computeStat_WaitingLeafValuesStartAddr;
     } else {
       if (debug())
         DPRINTF(WindowManager,
                 "Did not find a global port to read %d bytes from 0x%016x\n",
                 owner->tsDataSize, childStartAddr);
     }
-  } else if (state == computeStat_RequestCoreChildren) {
+  } else if (state == computeStat_RequestCoreChildAddr) {
     if (debug())
-      DPRINTF(WindowManager, "State: computeStat_RequestCoreChildren\n");
+      DPRINTF(WindowManager, "State: computeStat_RequestCoreChildAddr\n");
 
     Addr childStartAddr =
         traverseStackHead.first + (numReceivedChildren + 3) * owner->tsDataSize;
@@ -595,7 +594,7 @@ void WindowManager::TimeseriesWindow::traverseTick() {
           owner->readFromPort(memory_port, childStartAddr, owner->tsDataSize);
       owner->activeTimeseriesWindowRequests[this].push_back(read_req);
 
-      state = computeStat_WaitingCoreChildren;
+      state = computeStat_WaitingCoreChildAddr;
     } else {
       if (debug())
         DPRINTF(WindowManager,
@@ -606,7 +605,7 @@ void WindowManager::TimeseriesWindow::traverseTick() {
     if (debug())
       DPRINTF(WindowManager, "State: computeStat_RequestCoreChildStat\n");
 
-    Addr childStatAddr = baseMemoryAddr + 2 * owner->tsDataSize;
+    Addr childStatAddr = computeStatChildAddr + coreStatOffset;
 
     if (GlobalPort *memory_port =
             owner->getValidGlobalPort(childStatAddr, true)) {
@@ -643,7 +642,7 @@ void WindowManager::TimeseriesWindow::traverseTick() {
     if (debug())
       DPRINTF(WindowManager, "State: computeStat_SaveResult\n");
 
-    Addr currentCoreStatAddr = traverseStackHead.first + 2 * owner->tsDataSize;
+    Addr currentCoreStatAddr = traverseStackHead.first + coreStatOffset;
 
     if (GlobalPort *memory_port =
             owner->getValidGlobalPort(currentCoreStatAddr, true)) {
@@ -738,7 +737,7 @@ void WindowManager::TimeseriesWindow::traverseTick() {
                                  owner->tsDataSize;
     Addr cache_entry_stat_addr = owner->spmAddr +
                                  currentCacheEntryIndex * cacheEntrySize +
-                                 2 * owner->tsDataSize;
+                                 coreStatOffset;
 
     if (SPMPort *spm_port =
             owner->getValidSPMPort(cache_entry_meta_info_addr, false)) {
@@ -773,9 +772,8 @@ void WindowManager::TimeseriesWindow::traverseTick() {
     Addr cache_entry_hash_addr = owner->spmAddr +
                                  minAccessTickIndex * cacheEntrySize +
                                  owner->tsDataSize;
-    Addr cache_entry_stat_addr = owner->spmAddr +
-                                 minAccessTickIndex * cacheEntrySize +
-                                 2 * owner->tsDataSize;
+    Addr cache_entry_stat_addr =
+        owner->spmAddr + minAccessTickIndex * cacheEntrySize + coreStatOffset;
 
     if (SPMPort *spm_port =
             owner->getValidSPMPort(cache_entry_meta_info_addr, false)) {
@@ -956,10 +954,10 @@ void WindowManager::TimeseriesWindow::handleMemoryResponseData(uint64_t data) {
     } else {
       state = requestTraverseChildren;
     }
-  } else if (state == computeStat_WaitingLeafChildStartAddr) {
+  } else if (state == computeStat_WaitingLeafValuesStartAddr) {
     if (debug())
       DPRINTF(WindowManager,
-              "State: computeStat_WaitingLeafChildStartAddr; the child "
+              "State: computeStat_WaitingLeafValuesStartAddr; the child "
               "address is 0x%016x\n",
               data);
 
@@ -968,14 +966,14 @@ void WindowManager::TimeseriesWindow::handleMemoryResponseData(uint64_t data) {
         owner->writeToPort(openPEPort, data, openPEPort->getStartAddr());
     owner->activeTimeseriesWindowRequests[this].push_back(write_req);
     state = computeStat_RequestResult;
-  } else if (state == computeStat_WaitingCoreChildren) {
+  } else if (state == computeStat_WaitingCoreChildAddr) {
     if (debug())
       DPRINTF(WindowManager,
-              "State: computeStat_WaitingCoreChildren; the child address is "
+              "State: computeStat_WaitingCoreChildAddr; the child address is "
               "0x%016x\n",
               data);
 
-    baseMemoryAddr = data;
+    computeStatChildAddr = data;
     numReceivedChildren++;
     state = computeStat_RequestCoreChildStat;
   } else if (state == computeStat_WaitingCoreChildStat) {
@@ -994,7 +992,7 @@ void WindowManager::TimeseriesWindow::handleMemoryResponseData(uint64_t data) {
       numReceivedChildren = 0;
       state = computeStat_RequestResult;
     } else {
-      state = computeStat_RequestCoreChildren;
+      state = computeStat_RequestCoreChildAddr;
     }
   } else if (state == computeStat_WaitingResult) {
     if (debug())
@@ -1178,8 +1176,8 @@ void WindowManager::handleSignalPEResponse(MemoryRequest *read_req,
        idx < pe_req.startElement + pe_req.length; idx++)
     offsets.push_back(idx * signalDataSize);
 
-  Window *window =
-      new Window(this, base_addr, offsets, signalCurrentFreeSPMAddr, pe_port);
+  SignalWindow *window = new SignalWindow(this, base_addr, offsets,
+                                          signalCurrentFreeSPMAddr, pe_port);
   activeSignalWindows.push(window);
 
   // Move the SPM poninter based on PE request
@@ -1215,13 +1213,13 @@ void WindowManager::signalTick() {
        it != activeSignalWindowRequests.end(); it++)
     if (it->second.empty()) {
       // respond to the corresponding PE
-      Window *window = it->first;
+      SignalWindow *window = it->first;
       sendSPMAddrToPE(window->getCorrespondingPEPort(),
                       window->getSPMBaseAddr());
       activeSignalWindowRequests.erase(it);
     }
 
-  // check the single ongoing Window (head of the queue)
+  // check the single ongoing SignalWindow (head of the queue)
   if (activeSignalWindows.size()) {
     if (debug())
       DPRINTF(WindowManager, "Going over the head window...\n");
@@ -1230,22 +1228,22 @@ void WindowManager::signalTick() {
     }
   }
 
-  // check all spmRetryPackets and send them to the SPM
-  while (!spmRetryPackets.empty()) {
-    Window *window = spmRetryPackets.front().first;
-    uint64_t data = spmRetryPackets.front().second;
+  // check all spmRetryRequests and send them to the SPM
+  while (!spmRetryRequests.empty()) {
+    SignalWindow *window = spmRetryRequests.front().first;
+    uint64_t data = spmRetryRequests.front().second;
     if (window->sendSPMRequest(data))
-      spmRetryPackets.pop();
+      spmRetryRequests.pop();
   }
 }
 
 void WindowManager::handleSignalMemoryResponse(PacketPtr pkt,
                                                MemoryRequest *read_req) {
-  Window *window = findCorrespondingSignalWindow(pkt);
+  SignalWindow *window = findCorrespondingSignalWindow(pkt);
   uint64_t data = *((uint64_t *)read_req->getBuffer());
 
   if (!window->sendSPMRequest(data)) {
-    spmRetryPackets.push(std::make_pair(window, data));
+    spmRetryRequests.push(std::make_pair(window, data));
   }
 
   removeSignalWindowRequest(read_req);
@@ -1275,12 +1273,13 @@ WindowManager::constructSignalPERequest(MemoryRequest *read_req) {
   return (SignalPERequest){source_addr, start_element, length};
 }
 
-WindowManager::Window::Window(WindowManager *owner, Addr base_memory_addr,
-                              const std::vector<Offset> &offsets,
-                              Addr base_spm_addr, PEPort *pe_port)
-    : windowName("Window"), owner(owner), baseMemoryAddr(base_memory_addr),
-      spmBaseAddr(base_spm_addr), currentSPMOffset(0),
-      correspondingPEPort(pe_port) {
+WindowManager::SignalWindow::SignalWindow(WindowManager *owner,
+                                          Addr base_memory_addr,
+                                          const std::vector<Offset> &offsets,
+                                          Addr base_spm_addr, PEPort *pe_port)
+    : windowName("SignalWindow"), owner(owner),
+      baseMemoryAddr(base_memory_addr), spmBaseAddr(base_spm_addr),
+      currentSPMOffset(0), correspondingPEPort(pe_port) {
   for (Offset o : offsets) {
     Addr req_addr = baseMemoryAddr + o;
 
@@ -1296,7 +1295,7 @@ WindowManager::Window::Window(WindowManager *owner, Addr base_memory_addr,
   }
 }
 
-bool WindowManager::Window::sendMemoryRequest() {
+bool WindowManager::SignalWindow::sendMemoryRequest() {
   if (memoryRequests.empty()) {
     if (debug())
       DPRINTF(WindowManager, "No more memory read requests to send\n");
@@ -1329,7 +1328,7 @@ bool WindowManager::Window::sendMemoryRequest() {
   return true;
 }
 
-bool WindowManager::Window::sendSPMRequest(uint64_t data) {
+bool WindowManager::SignalWindow::sendSPMRequest(uint64_t data) {
   // create the SPM write packet and send it!
   Addr addr = spmBaseAddr + currentSPMOffset;
   SPMPort *spm_port = owner->getValidSPMPort(addr, false);
@@ -1653,7 +1652,7 @@ void WindowManager::removeRequest(MemoryRequest *mem_req,
   //           removal)\n");
 }
 
-WindowManager::Window *
+WindowManager::SignalWindow *
 WindowManager::findCorrespondingSignalWindow(PacketPtr pkt) {
   for (const auto &elem : activeSignalWindowRequests)
     for (const auto &req : elem.second)

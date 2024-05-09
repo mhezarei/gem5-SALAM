@@ -70,7 +70,7 @@ private:
 
   class GenericRequestPort : public StreamRequestPort {
     friend class WindowManager;
-    friend class Window;
+    friend class SignalWindow;
 
   protected:
     WindowManager *owner;
@@ -197,10 +197,10 @@ private:
       saveCache_Replace,
 
       computeStat,
-      computeStat_RequestLeafChildrenStartAddr,
-      computeStat_WaitingLeafChildStartAddr,
-      computeStat_RequestCoreChildren,
-      computeStat_WaitingCoreChildren,
+      computeStat_RequestLeafValuesStartAddr,
+      computeStat_WaitingLeafValuesStartAddr,
+      computeStat_RequestCoreChildAddr,
+      computeStat_WaitingCoreChildAddr,
       computeStat_RequestCoreChildStat,
       computeStat_WaitingCoreChildStat,
       computeStat_RequestResult,
@@ -229,7 +229,7 @@ private:
     std::vector<uint64_t> endResults;
     std::pair<Addr, bool> traverseStackHead;
     PEPort *openPEPort;
-    Addr baseMemoryAddr;
+    Addr computeStatChildAddr;
     uint64_t computedResult;
     uint64_t numCheckedNodes;
 
@@ -263,7 +263,7 @@ private:
     bool useCache() { return shouldUseCache; }
   };
 
-  class Window {
+  class SignalWindow {
   private:
     std::string windowName;
     WindowManager *owner;
@@ -275,9 +275,9 @@ private:
     PEPort *correspondingPEPort;
 
   public:
-    Window(WindowManager *owner, Addr base_memory_addr,
-           const std::vector<Offset> &offsets, Addr base_spm_addr,
-           PEPort *pe_port);
+    SignalWindow(WindowManager *owner, Addr base_memory_addr,
+                 const std::vector<Offset> &offsets, Addr base_spm_addr,
+                 PEPort *pe_port);
     bool debug() { return owner->debug(); }
     bool sendMemoryRequest();
     bool sendSPMRequest(uint64_t data);
@@ -301,12 +301,6 @@ private:
   uint8_t *mmr;
   ByteOrder endian;
 
-  // Class variables
-  std::vector<bool> finishedPEs;
-
-  // SPM related info
-  Addr signalCurrentFreeSPMAddr;
-
   // Ports
   std::vector<SPMPort *> spmPorts;
   std::vector<LocalPort *> localPorts;
@@ -314,14 +308,21 @@ private:
   std::vector<PEPort *> peRequestStreamPorts;
   std::vector<PEPort *> peResponseStreamPorts;
 
-  // Necessary data structures
-  std::queue<std::pair<Window *, uint64_t>> spmRetryPackets;
+  // data structures
   std::vector<MemoryRequest *> activeReadRequests;
   std::vector<MemoryRequest *> activeWriteRequests;
+
+  // signal data structures
+  std::queue<std::pair<SignalWindow *, uint64_t>> spmRetryRequests;
+  std::vector<bool> finishedPEs;
+  Addr signalCurrentFreeSPMAddr;
   // TODO: change this to vector with the necessary changes
-  std::queue<Window *> activeSignalWindows;
+  std::queue<SignalWindow *> activeSignalWindows;
+  std::map<SignalWindow *, std::vector<MemoryRequest *>>
+      activeSignalWindowRequests;
+
+  // timeseries data structures
   std::vector<TimeseriesWindow *> activeTimeseriesWindows;
-  std::map<Window *, std::vector<MemoryRequest *>> activeSignalWindowRequests;
   std::map<TimeseriesWindow *, std::vector<MemoryRequest *>>
       activeTimeseriesWindowRequests;
 
@@ -344,7 +345,7 @@ private:
   void handleSignalMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
   void sendSPMAddrToPE(PEPort *pe_port, Addr spm_addr);
   SignalPERequest constructSignalPERequest(MemoryRequest *read_req);
-  Window *findCorrespondingSignalWindow(PacketPtr pkt);
+  SignalWindow *findCorrespondingSignalWindow(PacketPtr pkt);
   void removeSignalWindowRequest(MemoryRequest *mem_req);
   bool isSignalMode() { return operatingMode == "signal"; }
 
