@@ -328,10 +328,6 @@ private:
   // Utility functions
   MemoryRequest *writeToPort(RequestPort *port, uint64_t data, Addr addr);
   MemoryRequest *readFromPort(RequestPort *port, Addr addr, size_t len);
-  void handleSignalPEResponse(MemoryRequest *read_req, PEPort *pe_port);
-  void handleSignalMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
-  void handleTimeseriesMemoryResponse(PacketPtr pkt, MemoryRequest *req);
-  void sendSPMAddrToPE(PEPort *pe_port, Addr spm_addr);
   void scheduleEvent(Tick when = 0);
   void recvPacket(PacketPtr pkt);
   bool checkPort(RequestPort *port, size_t len, bool is_read);
@@ -339,24 +335,29 @@ private:
                                 const std::vector<MemoryRequest *> &target_vec);
   void removeRequest(MemoryRequest *mem_req,
                      std::vector<MemoryRequest *> &target_vec);
-  SignalPERequest constructPERequestFromReadRequest(MemoryRequest *read_req);
   GlobalPort *getValidGlobalPort(Addr add, bool read);
   SPMPort *getValidSPMPort(Addr add, bool read = true);
-  SPMPort *findAvailableSPMPort();
+  uint64_t extractPERequestValue(MemoryRequest *read_req);
+
+  // Signal utility functions
+  void handleSignalPEResponse(MemoryRequest *read_req, PEPort *pe_port);
+  void handleSignalMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
+  void sendSPMAddrToPE(PEPort *pe_port, Addr spm_addr);
+  SignalPERequest constructSignalPERequest(MemoryRequest *read_req);
   Window *findCorrespondingSignalWindow(PacketPtr pkt);
   void removeSignalWindowRequest(MemoryRequest *mem_req);
+  bool isSignalMode() { return operatingMode == "signal"; }
+
+  // Timeseries utility functions
+  void handleTimeseriesMemoryResponse(PacketPtr pkt, MemoryRequest *req);
   TimeseriesWindow *findCorrespondingTimeseriesWindow(PacketPtr pkt);
   void removeTimeseriesWindowRequest(MemoryRequest *mem_req);
   void handleTimeseriesPEResponse(MemoryRequest *read_req, PEPort *pe_port);
-  uint64_t extractPERequestValue(MemoryRequest *read_req);
-
   bool isTimeseriesMode() { return operatingMode == "timeseries"; }
-  bool isSignalMode() { return operatingMode == "signal"; }
   bool allTimeseriesWindowsDone() {
-    for (auto &w : activeTimeseriesWindows)
-      if (!w->isDone())
-        return false;
-    return true;
+    return std::all_of(activeTimeseriesWindows.begin(),
+                       activeTimeseriesWindows.end(),
+                       [](auto &w) { return !w->isDone(); });
   }
 
 public:

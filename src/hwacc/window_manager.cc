@@ -1171,7 +1171,7 @@ void WindowManager::TimeseriesWindow::setTimeseriesPERequest(uint64_t value) {
 void WindowManager::handleSignalPEResponse(MemoryRequest *read_req,
                                            PEPort *pe_port) {
   // window creation
-  SignalPERequest pe_req = constructPERequestFromReadRequest(read_req);
+  SignalPERequest pe_req = constructSignalPERequest(read_req);
   Addr base_addr = pe_req.sourceAddr;
   std::vector<Offset> offsets;
   for (uint16_t idx = pe_req.startElement;
@@ -1265,7 +1265,7 @@ void WindowManager::sendSPMAddrToPE(PEPort *req_pe_port, Addr spm_addr) {
 }
 
 WindowManager::SignalPERequest
-WindowManager::constructPERequestFromReadRequest(MemoryRequest *read_req) {
+WindowManager::constructSignalPERequest(MemoryRequest *read_req) {
   uint64_t result = extractPERequestValue(read_req);
 
   uint32_t source_addr = result >> 32;
@@ -1641,7 +1641,7 @@ void WindowManager::removeRequest(MemoryRequest *mem_req,
             "Did not find the memory request with 0x%016x to remove!\n",
             mem_req->getAddress());
 
-  // TODO This is really wired. The code below should work but it doesn't.
+  // TODO This is really weird. The code below should work but it doesn't.
   // auto it =
   //     find_if(begin(target_vec), end(target_vec),
   //             [&memReq](const MemoryRequest * mr) { return mr == memReq; });
@@ -1733,11 +1733,7 @@ void WindowManager::GenericRequestPort::recvReqRetry() {
       DPRINTF(WindowManager, "Unblocked, sent blocked packet.\n");
     retryPackets.pop();
 
-    // TODO: This should just signal the engine that the packet completed
-    // engine should schedule tick as necessary. Need a test case
-    if (!owner->tickEvent.scheduled()) {
-      owner->scheduleEvent();
-    }
+    owner->scheduleEvent();
   }
 }
 
@@ -1768,11 +1764,7 @@ void WindowManager::SPMPort::recvReqRetry() {
       DPRINTF(WindowManager, "Unblocked, sent blocked packet.\n");
     retryPackets.pop();
 
-    // TODO: This should just signal the engine that the packet completed
-    // engine should schedule tick as necessary. Need a test case
-    if (!owner->tickEvent.scheduled()) {
-      owner->scheduleEvent();
-    }
+    owner->scheduleEvent();
   }
 }
 
