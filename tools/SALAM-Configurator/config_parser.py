@@ -145,6 +145,7 @@ class AccCluster:
             pio_size = None
             master = None
             debug = False
+            num_mem_ports = None
             variables = []
 
             # Find the name first...
@@ -163,6 +164,8 @@ class AccCluster:
                     master = device_dict["PIOMaster"]
                 if "Debug" in device_dict:
                     debug = device_dict["Debug"]
+                if "MemoryPorts" in device_dict:
+                    num_mem_ports = device_dict["MemoryPorts"]
                 if "Var" in device_dict:
                     for var in device_dict["Var"]:
                         # Setup the variable's parameters to pass
@@ -205,6 +208,7 @@ class AccCluster:
                     master=master,
                     variables=variables,
                     debug=debug,
+                    num_mem_ports=num_mem_ports,
                 )
             )
 
@@ -339,9 +343,9 @@ class AccCluster:
         lines.append("	system.iobus.mem_side_ports = clstr.local_bus.cpu_side_ports")
         # Need to define l2coherency in the YAML file?
         lines.append(
-            "	clstr._connect_caches(system, options, l2coherent=True, cache_size='2MiB')"
+            "	clstr._connect_caches(system, options, l2coherent=False, cache_size='16MiB')"
         )
-        lines.append("	clstr.cluster_cache.assoc = 16")
+        # lines.append("	clstr.cluster_cache.assoc = 16")
         lines.append("	gic = system.realview.gic")
         lines.append("")
 
@@ -349,13 +353,16 @@ class AccCluster:
 
 
 class WindowManager:
-    def __init__(self, name, pio_addr, pio_size, master, variables, debug: bool):
+    def __init__(
+        self, name, pio_addr, pio_size, master, variables, debug, num_mem_ports
+    ):
         self.name = name.lower()
         self.pio_addr = pio_addr
         self.pio_size = pio_size
         self.master = master
         self.variables = variables
         self.debug = debug
+        self.num_mem_ports = num_mem_ports
 
     def genDefinition(self):
         lines = []
@@ -372,7 +379,8 @@ class WindowManager:
 
         lines.append("# " + self.name + " Config")
         lines.append(f"clstr.{self.name}.local = clstr.local_bus.cpu_side_ports")
-        lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
+        for _ in range(self.num_mem_ports):
+            lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
         lines.append(f"clstr.{self.name}.pio = clstr.local_bus.mem_side_ports")
         lines.append(f"clstr.{self.name}.debug_enabled = {str(self.debug)}")
         lines.append("")
@@ -492,7 +500,8 @@ class Accelerator:
                 # lines.append("clstr." + self.name + ".pio " +
                 #              "=" " clstr." + i + ".local")
         # Assign ACP
-        lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
+        for _ in range(64):
+            lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
         # Add StreamIn
         for inCon in self.stream_in:
             lines.append(

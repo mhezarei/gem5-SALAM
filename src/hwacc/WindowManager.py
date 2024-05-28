@@ -24,7 +24,7 @@ class WindowManager(BasicPioDevice):
         "Request ports connected to processing element queues"
     )
     pe_resp_stream_ports = VectorRequestPort(
-        "Request ports connected to processing element queues"
+        "Response ports connected to processing element queues"
     )
     local = VectorRequestPort("Request ports connected to local cluster xbar")
     acp = VectorRequestPort(

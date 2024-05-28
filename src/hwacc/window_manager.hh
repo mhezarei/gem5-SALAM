@@ -21,9 +21,33 @@ private:
   inline static const size_t signalDataSize = 4;
   inline static const uint64_t endToken = 0xFFFFFFFFFFFFFFFF;
   inline static const Addr spmAddr = 0x10021080;
-  inline static const size_t spmSize = 1024;
-  inline static const Addr tsCoresStartAddr = 0x80C00000;
+  inline static const size_t spmSize = 16 * 1024 * 1024;
   inline static const std::string operatingMode = "timeseries";
+  // TODO: clean this up please
+  inline static const size_t cacheEntrySize = 24;
+  inline static const bool fixedCache = false;
+  inline static const bool fakeValues = true;
+
+  inline static const size_t numPerPERequests = 1000;
+  inline static const size_t perRequestPEConcurrentTimeseriesWindows = 4;
+  inline static const std::vector<Addr> calcAddresses = {
+      0x100201c0, 0x10020240, 0x100202c0, 0x10020340, 0x100203c0, 0x10020440,
+      0x100204c0, 0x10020540, 0x100205c0, 0x10020640, 0x100206c0, 0x10020740,
+      0x100207c0, 0x10020840, 0x100208c0, 0x10020940, 0x100209c0, 0x10020a40,
+      0x10020ac0, 0x10020b40, 0x10020bc0, 0x10020c40, 0x10020cc0, 0x10020d40,
+      0x10020dc0, 0x10020e40, 0x10020ec0, 0x10020f40, 0x10020fc0, 0x10021040,
+      0x100210c0, 0x10021140, 0x100211c0, 0x10021240, 0x100212c0, 0x10021340,
+      0x100213c0, 0x10021440, 0x100214c0, 0x10021540, 0x100215c0, 0x10021640,
+      0x100216c0, 0x10021740, 0x100217c0, 0x10021840, 0x100218c0, 0x10021940,
+      0x100219c0, 0x10021a40, 0x10021ac0, 0x10021b40, 0x10021bc0, 0x10021c40,
+      0x10021cc0, 0x10021d40, 0x10021dc0, 0x10021e40, 0x10021ec0, 0x10021f40,
+      0x10021fc0, 0x10022040, 0x100220c0, 0x10022140,
+  };
+  inline static const std::vector<Addr> reqPEAddresses = {
+      0x10027b40, 0x10027c80, 0x10027dc0, 0x10027f00, 0x10028040, 0x10028180,
+      0x100282c0, 0x10028400, 0x10028540, 0x10028680, 0x100287c0, 0x10028900,
+      0x10028a40, 0x10028b80, 0x10028cc0, 0x10028e00,
+  };
 
 private:
   struct SignalPERequest {
@@ -85,6 +109,7 @@ private:
 
     void addRetryPacket(PacketPtr pkt) { retryPackets.push(pkt); }
     bool hasRetryPackets() { return !retryPackets.empty(); }
+    Addr getStartAddr() { return (*getAddrRanges().begin()).start(); }
 
     virtual bool recvTimingResp(PacketPtr pkt);
     virtual void recvReqRetry();
@@ -103,7 +128,6 @@ private:
 
   protected:
     std::string getPENameFromPeerPort();
-    Addr getStartAddr() { return (*getAddrRanges().begin()).start(); }
   };
 
   class LocalPort : public GenericRequestPort {
@@ -138,16 +162,29 @@ private:
   class TimeseriesWindow {
   private:
     inline static const bool shouldUseCache = false;
+    inline static const std::string cacheInUse = "fairy";
     inline static const size_t batchSize = 64;
-    inline static const size_t numChildren = 16;
+    inline static const size_t numChildren = 64;
     inline static const size_t cacheEntrySize = 24;
+    inline static const Addr tsCoresStartAddr = 0x80c00000;
     /*
-      8KB data: 0x80c00118 - 0x80C00460
-      64MB data: 0x80c0a218 - 0x80ca2180
-      1GB data: 0x80ca2218 - 0x81622180
+      8KB data: 0x80c00118 - 0x80c00498
+      64MB data: 0x80c0a218 - 0x80ca2218
+      1GB data: 0x856aaa98 - 0x936aaa98
+      4GB data: 0x81622218 - 0x8ae22218
+
+      F64B64: 0x80e20818 - 0x89420818
+      F4B4: 0x856aaa98 - 0x936aaa98
+      F8B8: 0x82524918 - 0x8d524918
+      F16B16: 0x81622218 - 0x8ae22218
+      F32B32: 0x81508418 - 0x92d08418
     */
-    inline static const Addr leafCoresStartAddr = 0x80c0a218;
-    inline static const Addr leafCoresEndAddr = 0x80ca2180;
+    inline static const Addr leafCoresStartAddr = 0x80e20818;
+    inline static const Addr leafCoresEndAddr = 0x89420818;
+    /*
+      Ideal: leaf cores end addr
+    */
+    inline static const Addr lastCachedAddr = 0x92d08418;
 
     inline static const size_t coreRangeStartOffset = 0;
     inline static const size_t coreRangeEndOffset = tsDataSize;
@@ -177,11 +214,11 @@ private:
       checkCache_WaitingCoreStart,
       checkCache_RequestCoreEnd,
       checkCache_WaitingCoreEnd,
-      checkCache_RequestScanCacheEntry,
-      checkCache_WaitingScanCacheEntry,
+      checkCache_RequestEntry,
+      checkCache_WaitingEntry,
       checkCache_RequestFoundEntryStat,
       checkCache_WaitingFoundEntryStat,
-      checkCache_UpdateFoundEntryAccessCycle,
+      checkCache_UpdateFoundEntryAccessTick,
       checkCache_NotFound,
 
       saveCache,
@@ -223,12 +260,13 @@ private:
     uint64_t currentCoreStart, currentCoreEnd;
     Addr currentComputationCoreAddr;
 
+    std::queue<size_t> scanChildrenIndices;
+
     // traversal info
     std::pair<Addr, uint64_t> currentPartial;
     std::stack<std::pair<Addr, bool>> traverseStack;
     std::vector<uint64_t> endResults;
     std::pair<Addr, bool> traverseStackHead;
-    PEPort *openPEPort;
     Addr computeStatChildAddr;
     uint64_t computedResult;
     uint64_t numCheckedNodes;
@@ -243,8 +281,11 @@ private:
     Tick minCacheEntryAccessTick;
     size_t minCacheEntryIndex;
 
+    // Tkh, koosi sher
+    PEPort *connectedCalcPort;
+
   public:
-    TimeseriesWindow(WindowManager *owner, PEPort *pe_port);
+    TimeseriesWindow(WindowManager *owner, PEPort *pe_port, size_t id);
     bool debug() { return owner->debug(); }
     void setTimeseriesPERequest(uint64_t value); // sets either start or end
     std::string name() const { return windowName; }
@@ -255,15 +296,27 @@ private:
     void traverseTick();
     void handleMemoryResponseData(uint64_t data);
     bool isDone() { return state == done; }
-    PEPort *findPEPortForComputeState();
+    PEPort *findFreeCalcUnitPort();
     bool isLeafNode(Addr node_addr);
     bool coresDone() {
       return traverseStack.empty() && computationCores.empty();
     }
     bool useCache() { return shouldUseCache; }
+    bool fairyCacheInUse() { return cacheInUse == "fairy"; }
+    bool realCacheInUse() { return cacheInUse == "real"; }
+    bool checkCacheFunction();
+    void saveCacheFunction();
   };
 
   class SignalWindow {
+  private:
+    inline static const bool shouldUseCache = false;
+    inline static const int numCores = 6;
+    inline static const std::map<std::string, Addr> coreStreamAddr = {
+        {"0_3", 0}, {"1_2", 0}, {"2_4", 0}, {"3_5", 0}, {"4_5", 0}};
+    inline static const std::map<std::string, Addr> wmCoreStreamAddr = {
+        {"0", 0}, {"1", 0}, {"2", 0}, {"3", 0}, {"4_5", 0}, {"5", 0}};
+
   private:
     std::string windowName;
     WindowManager *owner;
@@ -308,6 +361,20 @@ private:
   std::vector<PEPort *> peRequestStreamPorts;
   std::vector<PEPort *> peResponseStreamPorts;
 
+  // Tkh, koosi sher
+  std::map<Addr, bool> calcStatus;
+  std::queue<TimeseriesPERequest> requests;
+  std::map<Addr, std::vector<TimeseriesPERequest>> perPERequests;
+
+  // Fairy cache
+  std::vector<std::tuple<Tick, Addr, uint64_t>> fairyCache;
+  size_t numCacheAccesses, numCacheHits, numCacheMisses, numCacheReplacements,
+      numCacheInsertions;
+  std::map<Addr, size_t> missAddrCount;
+  std::map<Addr, size_t> hitAddrCount;
+  std::map<Addr, size_t> replaceAddrCount;
+  std::vector<Addr> fixedCacheAddresses;
+
   // data structures
   std::vector<MemoryRequest *> activeReadRequests;
   std::vector<MemoryRequest *> activeWriteRequests;
@@ -325,6 +392,8 @@ private:
   std::vector<TimeseriesWindow *> activeTimeseriesWindows;
   std::map<TimeseriesWindow *, std::vector<MemoryRequest *>>
       activeTimeseriesWindowRequests;
+  std::map<Addr, std::vector<TimeseriesWindow *>>
+      requestPEActiveTimeseriesWindows;
 
   // Utility functions
   MemoryRequest *writeToPort(RequestPort *port, uint64_t data, Addr addr);
@@ -360,6 +429,23 @@ private:
                        activeTimeseriesWindows.end(),
                        [](auto &w) { return w->isDone(); });
   }
+  void printPortRanges();
+  Addr getFreeCalcUnitAddr() {
+    for (const auto &pair : calcStatus) {
+      if (pair.second == false) {
+        return pair.first;
+      }
+    }
+    return 0;
+  }
+  void setCalcUnitStatus(Addr calc_unit_addr, bool busy) {
+    for (auto &pair : calcStatus) {
+      if (pair.first == calc_unit_addr) {
+        calcStatus[pair.first] = busy;
+      }
+    }
+  }
+  bool useFixedCache() { return fixedCache; }
 
 public:
   WindowManager(const WindowManagerParams &p);

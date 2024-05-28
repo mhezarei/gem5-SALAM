@@ -1,0 +1,15 @@
+Timeseries:
+    ✔ Respond port is not always the first port @done(24-05-10 22:11)
+    ☐ Better leaf core check logic
+    ✔ Matching (finding) PE response port @done(24-05-10 22:11)
+    ☐ Find the PE name from the port?
+    ☐ Is it OK for the to-be-removed request to not be present?
+    ☐ Weird issue in removing request
+    ☐ Merging `removeTimeseriesWindowRequest` and `removeSignalWindowRequest`
+    ✔ Multi-Acc execution @done(24-05-11 00:45)
+    ☐ Cache-check for every core vs. just the computation cores
+    ☐ Leaf's children might not always be sequential
+
+Signal Processing:
+    ☐ Comparing different approaches
+    ☐ Change `activeSignalWindows` to a vector with the necessary modifications
