@@ -443,7 +443,16 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
             "in saving to cache, smallest range %d-%d largest range %d-%d\n",
             low_access_entries.front().start, low_access_entries.front().end,
             low_access_entries.back().start, low_access_entries.back().end);
-  // case 3.4: replace smallest range
+  // case 3.4: replace smallest range ONLY IF your range is larger
+  uint64_t smallest_range_distance =
+      low_access_entries.front().end - low_access_entries.front().start + 1;
+  uint64_t cc_range_distance = cc_range.end - cc_range.start + 1;
+  if (cc_range_distance < smallest_range_distance) {
+    if (debug())
+      DPRINTF(WindowManager, "cannot replace with a lower range\n");
+    return;
+  }
+
   for (auto &entry : owner->timeseriesCache) {
     TimeseriesRange entry_range = std::get<1>(entry);
     if (entry_range == low_access_entries.front()) {
