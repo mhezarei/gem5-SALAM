@@ -25,27 +25,10 @@ WindowManager::WindowManager(const WindowManagerParams &p)
   numCacheMisses = 0;
   numCacheReplacements = 0;
   numCacheInsertions = 0;
-  size_t maxIdx = ((size_t)(spmSize / cacheEntrySize - 1));
+  maxCacheIndex = ((size_t)(spmSize / cacheEntrySize - 1));
 
-  if (useFixedCache()) {
-    // std::fstream file_stream(
-    //     "/local-scratch/localhome/mza148/Documents/Research/"
-    //     "codebase/gem5-SALAM-app/ts/fixedcache.txt",
-    //     std::ios_base::in);
-    // Addr a;
-    // while (file_stream >> a) {
-    //   fixedCacheAddresses.push_back((Addr)a);
-    // }
-    // DPRINTF(WindowManager, "fixed cache addresses size %d\n",
-    //         fixedCacheAddresses.size());
-
-    // for (size_t i = 0; i < maxIdx; i++) {
-    //   fairyCache.push_back(std::make_tuple(0, fixedCacheAddresses[i], 0));
-    // }
-  } else {
-    for (size_t i = 0; i < maxIdx; i++)
-      fairyCache.push_back(std::make_tuple(0, 0, 0));
-  }
+  // dummy values for testing!!!
+  // timeseriesCache.push_back(std::make_tuple(0, (TimeseriesRange){0, 63}, 1));
 }
 
 void WindowManager::recvPacket(PacketPtr pkt) {
@@ -124,21 +107,35 @@ WindowManager::TimeseriesWindow::TimeseriesWindow(WindowManager *owner,
     : state(none), windowName("TimeseriesWindow_" + std::to_string(id)),
       owner(owner), correspondingPEPort(pe_port), numReceivedChildren(0),
       currentCoreAddr(0), currentComputationCoreAddr(0), numCheckedNodes(0),
-      maxCacheIndex((size_t)(owner->spmSize / cacheEntrySize - 1)),
-      saveCacheCoreAddr(0), checkCacheCoreAddr(0),
-      minCacheEntryAccessTick(UINT64_MAX), minCacheEntryIndex(0),
       connectedCalcPort(nullptr) {
   if (debug())
-    DPRINTF(WindowManager, "maxCacheIndex %d\n", maxCacheIndex);
+    DPRINTF(WindowManager, "maxCacheIndex %d\n", owner->maxCacheIndex);
 }
 
 void WindowManager::TimeseriesWindow::firstScanTick() {
-  if (state == requestCoreStart) {
+  if (state == checkCache) {
+    if (useCache()) {
+      checkCacheFunction();
+      if (subQueries.empty()) { // all the query is hit
+        state = initTraverse;
+        return;
+      }
+    } else {
+      subQueries.push_back(initialQuery);
+    }
+
+    coreQueue.push(tsCoresStartAddr);
+    state = requestCoreStart;
+  } else if (state == requestCoreStart) {
     if (debug())
       DPRINTF(WindowManager, "State: requestCoreStart\n");
 
     if (coreQueue.empty()) {
-      state = firstScanDone;
+      if (childrenPointers.empty()) { // done
+        state = firstScanDone;
+      } else { // have to cover children
+        state = requestChildAddr;
+      }
       return;
     }
 
@@ -183,81 +180,68 @@ void WindowManager::TimeseriesWindow::firstScanTick() {
                 owner->tsDataSize, coreRangeEndAddr);
     }
   } else if (state == checkRange) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkRange\n");
+    for (auto &sub_q : subQueries) {
+      uint64_t inp_start = sub_q.start;
+      uint64_t inp_end = sub_q.end;
+      double node_start, node_end;
+      memcpy(&node_start, &currentCoreStart, sizeof(node_start));
+      memcpy(&node_end, &currentCoreEnd, sizeof(node_end));
 
-    uint64_t inp_start = peRequest.startTimestamp;
-    uint64_t inp_end = peRequest.endTimestamp;
-    double node_start, node_end;
-    memcpy(&node_start, &currentCoreStart, sizeof(node_start));
-    memcpy(&node_end, &currentCoreEnd, sizeof(node_end));
+      if (debug())
+        DPRINTF(WindowManager,
+                "Checking range inp_start:%d inp_end:%d against node_start:%f "
+                "node_end:%f\n",
+                inp_start, inp_end, node_start, node_end);
 
-    if (debug())
-      DPRINTF(WindowManager,
-              "Checking range inp_start:%d inp_end:%d against node_start:%f "
-              "node_end:%f\n",
-              inp_start, inp_end, node_start, node_end);
+      assert(node_start < node_end);
 
-    assert(node_start < node_end);
+      bool is_leaf = isLeafNode(currentCoreAddr);
+      bool case_skip = (node_start > inp_end) || (node_end < inp_start);
+      bool case_add_to_list = (inp_start <= node_start && node_end <= inp_end);
 
-    bool is_leaf = isLeafNode(currentCoreAddr);
-    bool case_skip = (node_start > inp_end) || (node_end < inp_start);
-    bool case_finished = (inp_start == node_start && node_end == inp_end);
-    bool case_add_to_list = (inp_start <= node_start && node_end <= inp_end);
+      if (debug())
+        DPRINTF(WindowManager, "is leaf %d skip %d add %d\n", is_leaf,
+                case_skip, case_add_to_list);
 
-    if (debug())
-      DPRINTF(WindowManager, "is leaf %d skip %d finished %d add %d\n", is_leaf,
-              case_skip, case_finished, case_add_to_list);
-
-    if (case_skip) {
-      state = requestCoreStart;
-    } else if (case_finished) {
-      computationCores.push(currentCoreAddr);
-      state = firstScanDone;
-    } else if (case_add_to_list) {
-      computationCores.push(currentCoreAddr);
-      state = requestCoreStart;
-    } else { // this means either leaf/partial or non-leaf/children
-      if (!is_leaf) {
-        double core_start, core_end;
-        memcpy(&core_start, &currentCoreStart, sizeof(core_start));
-        memcpy(&core_end, &currentCoreEnd, sizeof(core_end));
-
+      if (case_skip) { // skip
+        state = requestCoreStart;
+      } else if (case_add_to_list) { // add to list
+        if (std::find(computationCores.begin(), computationCores.end(),
+                      currentCoreAddr) == computationCores.end()) {
+          if (debug())
+            DPRINTF(WindowManager, "added to CCs: 0x%016x %f-%f\n",
+                    currentCoreAddr, node_start, node_end);
+          computationCores.push_back(currentCoreAddr);
+          owner->ccAddressToRange[currentCoreAddr] =
+              (TimeseriesRange){(uint64_t)node_start, (uint64_t)node_end};
+        }
+        state = requestCoreStart;
+      } else if (!is_leaf) { // non-leaf & children
         if (debug())
-          DPRINTF(WindowManager, "Request children for range %f - %f\n",
-                  core_start, core_end);
-
-        assert(scanChildrenIndices.empty());
-        uint64_t node_portion = (core_end - core_start + 1) / numChildren;
-        if (debug())
-          DPRINTF(WindowManager, "Portion %d\n", node_portion);
+          DPRINTF(WindowManager, "children of 0x%016x %f-%f are needed\n",
+                  currentCoreAddr, node_start, node_end);
 
         for (size_t i = 0; i < numChildren; i++) {
-          uint64_t child_start = core_start + i * node_portion;
-          uint64_t child_end = child_start + node_portion - 1;
-          bool skip = (child_start > inp_end) || (child_end < inp_start);
-          if (!skip) {
-            scanChildrenIndices.push(i);
-            if (debug())
-              DPRINTF(WindowManager, "Added child with range %d - %d\n",
-                      child_start, child_end);
+          Addr child_pointer = currentCoreAddr + (i + 3) * owner->tsDataSize;
+          if (std::find(childrenPointers.begin(), childrenPointers.end(),
+                        child_pointer) == childrenPointers.end()) {
+            childrenPointers.push_back(child_pointer);
           }
         }
-
-        state = requestChildAddr;
-      } else {
+        state = requestCoreStart;
+      } else { // leaf & partial
         double partial_start = fmax(inp_start, node_start);
         double partial_diff = fabs(partial_start - fmin(inp_end, node_end));
 
         Addr partial_start_addr =
             currentCoreAddr +
             ((uint64_t)(partial_start - node_start)) * coreStatOffset;
-        // GOD BLESS USA
         uint64_t partial_length = (uint64_t)partial_diff + 1;
 
         if (debug())
-          DPRINTF(WindowManager, "Added to partials 0x%016x, %d\n",
-                  partial_start_addr, partial_length);
+          DPRINTF(WindowManager,
+                  "added to partials 0x%016x, %d while on %f-%f\n",
+                  partial_start_addr, partial_length, node_start, node_end);
 
         partials.push(std::make_pair(partial_start_addr, partial_length));
         state = requestCoreStart;
@@ -270,254 +254,206 @@ void WindowManager::TimeseriesWindow::firstScanTick() {
     if (debug())
       DPRINTF(WindowManager, "State: requestChildAddr\n");
 
-    Addr childAddr =
-        currentCoreAddr + (scanChildrenIndices.front() + 3) * owner->tsDataSize;
+    Addr child_pointer = childrenPointers.front();
 
     if (debug())
-      DPRINTF(WindowManager,
-              "Requesting address for Child number %d which is inside address "
-              "0x%016x\n",
-              scanChildrenIndices.front(), childAddr);
+      DPRINTF(WindowManager, "Requesting address for pointer 0x%016x\n",
+              child_pointer);
 
-    if (GlobalPort *memory_port = owner->getValidGlobalPort(childAddr, true)) {
+    if (GlobalPort *memory_port =
+            owner->getValidGlobalPort(child_pointer, true)) {
       MemoryRequest *read_req =
-          owner->readFromPort(memory_port, childAddr, owner->tsDataSize);
+          owner->readFromPort(memory_port, child_pointer, owner->tsDataSize);
       owner->activeTimeseriesWindowRequests[this].push_back(read_req);
       state = waitingChildAddr;
     } else {
       if (debug())
         DPRINTF(WindowManager,
                 "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, childAddr);
+                owner->tsDataSize, child_pointer);
     }
   } else if (state == firstScanDone) {
     state = initTraverse;
   }
 }
 
-bool WindowManager::TimeseriesWindow::checkCacheFunction() {
+void WindowManager::TimeseriesWindow::checkCacheFunction() {
   if (debug())
-    DPRINTF(WindowManager, "welcome to check hell!\n");
+    DPRINTF(WindowManager, "Checking the cache for the initial query %d %d\n",
+            initialQuery.start, initialQuery.end);
 
-  if (fairyCacheInUse()) {
-    owner->numCacheAccesses++;
-    currentCoreHash = traverseStack.top().first;
-    if (debug())
-      DPRINTF(WindowManager, "looking for this addr 0x%016x\n",
-              currentCoreHash);
+  owner->numCacheAccesses++;
 
-    if (!owner->useFixedCache()) {
-      for (auto &tup : owner->fairyCache) {
-        if (std::get<1>(tup) == currentCoreHash) {
-          if (debug())
-            DPRINTF(WindowManager,
-                    "computation core exists in the fairy cache\n");
+  // step 1: add all entries inside the initial query
+  std::vector<TimeseriesRange> nominated_ranges;
+  if (useIdealCache()) {
+    size_t num_ll_nodes = (leafCoresEndAddr - leafCoresStartAddr) /
+                          ((numChildren + 3) * owner->tsDataSize);
+    size_t ll_node_range = batchSize * numChildren;
+    for (size_t i = 0; i < num_ll_nodes; i++) {
+      uint64_t entry_start = i * ll_node_range;
+      uint64_t entry_end = entry_start + ll_node_range - 1;
 
-          owner->hitAddrCount[currentCoreHash]++;
-          owner->numCacheHits++;
-          std::get<0>(tup) = curTick();
-          currentCacheEntryIndex = 0;
-          currentCoreHash = 0;
-          traverseStack.pop();
-          if (traverseStack.empty()) {
-            if (debug())
-              DPRINTF(WindowManager,
-                      "done one computation core with cache stat\n");
-            endResults.push_back(std::get<2>(tup));
-            state = initTraverse;
-            return false;
-          }
-          state = requestStat;
-          return false;
-        }
+      if (entry_start >= initialQuery.start && entry_end <= initialQuery.end) {
+        nominated_ranges.push_back((TimeseriesRange){entry_start, entry_end});
+        endResults.push_back(1);
       }
+    }
+  } else {
+    for (auto &tup : owner->timeseriesCache) {
+      uint64_t entry_start = std::get<1>(tup).start;
+      uint64_t entry_end = std::get<1>(tup).end;
 
-      if (debug())
-        DPRINTF(WindowManager,
-                "computation core was not found in the fairy cache\n");
-
-      owner->missAddrCount[currentCoreHash]++;
-      owner->numCacheMisses++;
-      currentCacheEntryIndex = 0;
-      currentCoreHash = 0;
-      state = requestStat;
-      return true;
-    } else {
-      if (currentCoreHash < lastCachedAddr) {
-        if (debug())
-          DPRINTF(WindowManager,
-                  "computation core 0x%016x exists in the fixed cache\n",
-                  currentCoreHash);
-        owner->hitAddrCount[currentCoreHash]++;
-        owner->numCacheHits++;
-        currentCacheEntryIndex = 0;
-        currentCoreHash = 0;
-        traverseStack.pop();
-        if (traverseStack.empty()) {
-          uint64_t stat = 18405011;
-          if (debug())
-            DPRINTF(
-                WindowManager,
-                "done one computation core with cache stat which is 0x%016x\n",
-                stat);
-          endResults.push_back(stat);
-          state = initTraverse;
-          return false;
-        }
-        state = requestStat;
-        return false;
-      } else {
-        if (debug())
-          DPRINTF(WindowManager, "addr 0x%016x not in fixed cache\n",
-                  currentCoreHash);
-        owner->missAddrCount[currentCoreHash]++;
-        owner->numCacheMisses++;
-        currentCacheEntryIndex = 0;
-        currentCoreHash = 0;
-        state = requestStat;
-        return true;
+      if (entry_start >= initialQuery.start && entry_end <= initialQuery.end) {
+        nominated_ranges.push_back(std::get<1>(tup));
       }
-
-      // for (auto &tup : owner->fairyCache) {
-      //   if (std::get<1>(tup) == currentCoreHash) {
-      //     if (std::get<2>(tup) == 0) {
-      //       if (debug())
-      //         DPRINTF(WindowManager, "no stat yet on 0x%016x\n",
-      //                 currentCoreHash);
-
-      //       currentCacheEntryIndex = 0;
-      //       currentCoreHash = 0;
-      //       state = requestStat;
-      //       return true;
-      //     } else {
-      //       if (debug())
-      //         DPRINTF(WindowManager,
-      //                 "computation core 0x%016x exists in the fixed cache\n",
-      //                 currentCoreHash);
-
-      //       owner->hitAddrCount[currentCoreHash]++;
-      //       owner->numCacheHits++;
-      //       currentCacheEntryIndex = 0;
-      //       currentCoreHash = 0;
-      //       traverseStack.pop();
-      //       if (traverseStack.empty()) {
-      //         if (debug())
-      //           DPRINTF(WindowManager,
-      //                   "done one computation core with cache stat\n");
-      //         endResults.push_back(std::get<2>(tup));
-      //         state = initTraverse;
-      //         return false;
-      //       }
-      //       state = requestStat;
-      //       return false;
-      //     }
-      //   }
-      // }
-
-      // if (debug())
-      //   DPRINTF(WindowManager, "addr 0x%016x not in fixed cache\n",
-      //           currentCoreHash);
-
-      // owner->missAddrCount[currentCoreHash]++;
-      // owner->numCacheMisses++;
-      // currentCacheEntryIndex = 0;
-      // currentCoreHash = 0;
-      // state = requestStat;
-      // return true;
     }
   }
 
-  assert(state == requestStat);
-  return true;
+  // no nominated range -> missed
+  if (nominated_ranges.empty()) {
+    if (debug())
+      DPRINTF(WindowManager, "found no hit ranges inside cache\n");
+
+    subQueries.push_back(initialQuery);
+    owner->numCacheMisses++;
+    owner->missedRanges[initialQuery]++;
+    return;
+  }
+
+  // step 2: select largest entries
+  std::vector<TimeseriesRange> largest_ranges;
+  for (auto &e1 : nominated_ranges) {
+    bool is_large = true;
+    for (auto &e2 : nominated_ranges) {
+      if ((e2.start < e1.start && e2.end > e1.end) ||
+          (e2.start == e1.start && e2.end > e1.end) ||
+          (e2.start < e1.start && e2.end == e1.end)) {
+        is_large = false;
+        break;
+      }
+    }
+    if (is_large) {
+      largest_ranges.push_back(e1);
+    }
+  }
+
+  // step 2.5: sort largest entries
+  std::sort(largest_ranges.begin(), largest_ranges.end());
+
+  // step 3: add hit results
+  for (auto &e : largest_ranges) {
+    for (auto &tup : owner->timeseriesCache) {
+      TimeseriesRange entry_range = std::get<1>(tup);
+      if (e == entry_range) {
+        if (debug())
+          DPRINTF(WindowManager, "found a covered range inside cache %d-%d\n",
+                  entry_range.start, entry_range.end);
+
+        std::get<0>(tup) = std::get<0>(tup) + 1;
+        endResults.push_back(std::get<2>(tup));
+
+        owner->numCacheHits++;
+        owner->hitRanges[entry_range]++;
+        break;
+      }
+    }
+  }
+
+  // step 4: make subQueries
+  uint64_t start = initialQuery.start;
+  for (auto &e : largest_ranges) {
+    if (e.start > start) {
+      if (debug())
+        DPRINTF(WindowManager, "added sub query %d-%d\n", start, e.start - 1);
+      subQueries.push_back((TimeseriesRange){start, e.start - 1});
+    }
+    start = e.end + 1;
+  }
+  if (start < initialQuery.end) {
+    if (debug())
+      DPRINTF(WindowManager, "added sub query %d-%d\n", start,
+              initialQuery.end);
+    subQueries.push_back((TimeseriesRange){start, initialQuery.end});
+  }
 }
 
-void WindowManager::TimeseriesWindow::saveCacheFunction() {
+void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
+                                                        uint64_t cc_stat) {
+  if (useIdealCache())
+    return;
+
+  TimeseriesRange cc_range = owner->ccAddressToRange[cc_address];
   if (debug())
-    DPRINTF(WindowManager, "welcome to save hell!\n");
+    DPRINTF(WindowManager, "saving 0x%016x %d-%d stat 0x%016x to cache\n",
+            cc_address, cc_range.start, cc_range.end, cc_stat);
 
-  if (fairyCacheInUse()) {
-    currentCoreHash = traverseStackHead.first;
-    saveCacheEntryStat = computedResult;
-
-    if (debug())
-      DPRINTF(WindowManager, "saving this core 0x%016x\n", currentCoreHash);
-
-    if (!owner->useFixedCache()) {
-      minCacheEntryAccessTick = UINT64_MAX;
-
-      for (auto &tup : owner->fairyCache) {
-        if (std::get<1>(tup) == currentCoreHash) {
-          if (debug())
-            DPRINTF(WindowManager, "insertion already exists 0x%016x\n",
-                    currentCoreHash);
-
-          std::get<0>(tup) = curTick();
-          saveCacheEntryStat = 0;
-          currentCoreHash = 0;
-          return;
-        }
-      }
-
-      for (auto &tup : owner->fairyCache) {
-        if (std::get<0>(tup) == 0) {
-          if (debug())
-            DPRINTF(WindowManager,
-                    "going to insert a new entry 0x%016x to fairy cache with "
-                    "the size of "
-                    "%d\n",
-                    currentCoreHash, owner->fairyCache.size());
-
-          owner->numCacheInsertions++;
-          std::get<0>(tup) = curTick();
-          std::get<1>(tup) = currentCoreHash;
-          std::get<2>(tup) = saveCacheEntryStat;
-          saveCacheEntryStat = 0;
-          currentCoreHash = 0;
-          return;
-        } else {
-          if (debug())
-            DPRINTF(WindowManager, "seen non-zero cache entry\n");
-          if (std::get<0>(tup) <= minCacheEntryAccessTick) {
-            minCacheEntryAccessTick = std::get<0>(tup);
-            if (debug())
-              DPRINTF(WindowManager, "min changed to %d\n",
-                      minCacheEntryAccessTick);
-          }
-        }
-      }
-
+  // case 1: cc address already in cache -> increase hit number
+  for (auto &entry : owner->timeseriesCache) {
+    TimeseriesRange entry_range = std::get<1>(entry);
+    if (entry_range == cc_range) {
       if (debug())
-        DPRINTF(WindowManager, "going to replace an entry in fairy cache\n");
+        DPRINTF(WindowManager,
+                "request address already exists in cache; updating\n");
 
-      owner->replaceAddrCount[currentCoreHash]++;
-      owner->numCacheReplacements++;
-
-      if (debug())
-        DPRINTF(WindowManager, "min tick is %d\n", minCacheEntryAccessTick);
-
-      for (auto &tup : owner->fairyCache) {
-        if (std::get<0>(tup) == minCacheEntryAccessTick) {
-          std::get<0>(tup) = curTick();
-          std::get<1>(tup) = currentCoreHash;
-          std::get<2>(tup) = saveCacheEntryStat;
-          break;
-        }
-      }
-      minCacheEntryAccessTick = UINT64_MAX;
-      minCacheEntryIndex = -1;
-      saveCacheCoreAddr = 0;
-      currentCoreHash = 0;
+      std::get<0>(entry) = std::get<0>(entry) + 1;
+      std::get<2>(entry) = cc_stat;
       return;
-    } else {
-      for (auto &tup : owner->fairyCache) {
-        if (std::get<1>(tup) == currentCoreHash && std::get<2>(tup) == 0) {
-          std::get<2>(tup) = saveCacheEntryStat;
-          owner->numCacheInsertions++;
-          saveCacheEntryStat = 0;
-          currentCoreHash = 0;
-          return;
-        }
-      }
+    }
+  }
+
+  // case 2: cc not in cache; cache has space -> add to cache
+  if (!owner->isCacheFull()) {
+    if (debug())
+      DPRINTF(WindowManager, "cache not full; found empty entry\n");
+
+    owner->timeseriesCache.push_back(std::make_tuple(1, cc_range, cc_stat));
+    return;
+  }
+
+  // TODO: improve implementation
+  // case 3: cc not in cache; cache full -> replace
+  std::vector<TimeseriesRange> low_access_entries;
+  // case 3.1: find min number of accesses
+  size_t min_num_accesses = UINT64_MAX;
+  for (auto &entry : owner->timeseriesCache) {
+    size_t entry_num_accesses = std::get<0>(entry);
+    if (entry_num_accesses < min_num_accesses)
+      min_num_accesses = entry_num_accesses;
+  }
+  assert(min_num_accesses > 0);
+  if (debug())
+    DPRINTF(WindowManager, "in saving to cache, min num accesses in %d\n",
+            min_num_accesses);
+  // case 3.2: fill the nominated list
+  for (auto &entry : owner->timeseriesCache) {
+    size_t entry_num_accesses = std::get<0>(entry);
+    if (entry_num_accesses == min_num_accesses)
+      low_access_entries.push_back(std::get<1>(entry));
+  }
+  // case 3.3: sort nominated list
+  // current algo: based on range size
+  // TODO: better algos
+  std::sort(low_access_entries.begin(), low_access_entries.end(),
+            [](const TimeseriesRange &lhs, const TimeseriesRange &rhs) {
+              return (lhs.end - lhs.start) < (rhs.end - rhs.start);
+            });
+  if (debug())
+    DPRINTF(WindowManager,
+            "in saving to cache, smallest range %d-%d largest range %d-%d\n",
+            low_access_entries.front().start, low_access_entries.front().end,
+            low_access_entries.back().start, low_access_entries.back().end);
+  // case 3.4: replace smallest range
+  for (auto &entry : owner->timeseriesCache) {
+    TimeseriesRange entry_range = std::get<1>(entry);
+    if (entry_range == low_access_entries.front()) {
+      if (debug())
+        DPRINTF(WindowManager, "cache full; replaced smallest range\n");
+
+      std::get<0>(entry) = 1;
+      std::get<1>(entry) = cc_range;
+      std::get<2>(entry) = cc_stat;
+      return;
     }
   }
 }
@@ -563,143 +499,10 @@ void WindowManager::TimeseriesWindow::traverseTick() {
 
       traverseStack.push(std::make_pair(computationCores.front(), false));
       currentComputationCoreAddr = computationCores.front();
-      computationCores.pop();
+      computationCores.pop_front();
 
-      // alternate cache/no cache
-      // if (useCache()) {
-      // state = checkCache;
-      // } else {
       state = requestStat;
-      // }
     }
-  }
-
-  else if (state == checkCache) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkCache\n");
-
-    currentCoreHash = 0;
-    checkCacheCoreAddr = currentComputationCoreAddr;
-    currentCacheEntryIndex = 0;
-    state = checkCache_RequestCoreStart;
-  } else if (state == checkCache_RequestCoreStart) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkCache_RequestCoreStart\n");
-
-    assert(checkCacheCoreAddr != 0);
-    Addr core_start = checkCacheCoreAddr + coreRangeStartOffset;
-
-    if (GlobalPort *memory_port = owner->getValidGlobalPort(core_start, true)) {
-      MemoryRequest *read_req =
-          owner->readFromPort(memory_port, core_start, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = checkCache_WaitingCoreStart;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, core_start);
-    }
-  } else if (state == checkCache_RequestCoreEnd) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkCache_RequestCoreEnd\n");
-
-    assert(checkCacheCoreAddr != 0);
-    Addr core_end = checkCacheCoreAddr + coreRangeEndOffset;
-
-    if (GlobalPort *memory_port = owner->getValidGlobalPort(core_end, true)) {
-      MemoryRequest *read_req =
-          owner->readFromPort(memory_port, core_end, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = checkCache_WaitingCoreEnd;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, core_end);
-    }
-  } else if (state == checkCache_RequestEntry) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkCache_RequestEntry %d\n",
-              currentCacheEntryIndex);
-
-    assert(currentCoreHash != 0);
-
-    Addr cache_entry_hash_addr = owner->spmAddr +
-                                 currentCacheEntryIndex * cacheEntrySize +
-                                 owner->tsDataSize;
-
-    if (SPMPort *spm_port = owner->getValidSPMPort(cache_entry_hash_addr)) {
-      MemoryRequest *read_req = owner->readFromPort(
-          spm_port, cache_entry_hash_addr, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-
-      state = checkCache_WaitingEntry;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a spm port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, cache_entry_hash_addr);
-    }
-  } else if (state == checkCache_RequestFoundEntryStat) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkCache_RequestFoundEntryStat\n");
-
-    Addr cache_entry_result_addr = owner->spmAddr +
-                                   currentCacheEntryIndex * cacheEntrySize +
-                                   coreStatOffset;
-
-    if (SPMPort *spm_port = owner->getValidSPMPort(cache_entry_result_addr)) {
-      MemoryRequest *read_req = owner->readFromPort(
-          spm_port, cache_entry_result_addr, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-
-      state = checkCache_WaitingFoundEntryStat;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a spm port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, cache_entry_result_addr);
-    }
-  } else if (state == checkCache_UpdateFoundEntryAccessTick) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkCache_UpdateFoundEntryAccessTick\n");
-
-    Addr cache_entry_tick_addr =
-        owner->spmAddr + currentCacheEntryIndex * cacheEntrySize;
-
-    if (SPMPort *spm_port =
-            owner->getValidSPMPort(cache_entry_tick_addr, false)) {
-      MemoryRequest *write_req = owner->writeToPort(
-          spm_port, (uint64_t)curTick(), cache_entry_tick_addr);
-      owner->activeTimeseriesWindowRequests[this].push_back(write_req);
-
-      if (debug())
-        DPRINTF(WindowManager,
-                "done one computation core with cache hit 0x%016x 0x%016x\n",
-                currentCoreHash, currentComputationCoreAddr);
-
-      currentCacheEntryIndex = 0;
-      currentCoreHash = 0;
-      currentComputationCoreAddr = 0;
-
-      traverseStack.pop();
-      assert(traverseStack.empty());
-
-      state = initTraverse;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to write %d bytes to 0x%016x\n",
-                owner->tsDataSize, cache_entry_tick_addr);
-    }
-  } else if (state == checkCache_NotFound) {
-    if (debug())
-      DPRINTF(WindowManager, "State: checkCache_NotFound\n");
-
-    currentCacheEntryIndex = 0;
-    currentCoreHash = 0;
-    state = requestStat;
   }
 
   else if (state == requestStat) {
@@ -713,12 +516,6 @@ void WindowManager::TimeseriesWindow::traverseTick() {
 
       state = startTraverse;
       return;
-    }
-
-    if (useCache()) {
-      if (!checkCacheFunction()) {
-        return;
-      }
     }
 
     Addr statAddr = traverseStack.top().first + coreStatOffset;
@@ -941,10 +738,6 @@ void WindowManager::TimeseriesWindow::traverseTick() {
     if (debug())
       DPRINTF(WindowManager, "State: computeStat_SaveResult\n");
 
-    if (useCache()) {
-      saveCacheFunction();
-    }
-
     Addr currentCoreStatAddr = traverseStackHead.first + coreStatOffset;
 
     if (GlobalPort *memory_port =
@@ -958,150 +751,6 @@ void WindowManager::TimeseriesWindow::traverseTick() {
         DPRINTF(WindowManager,
                 "Did not find a global port to read %d bytes from 0x%016x\n",
                 owner->tsDataSize, currentCoreStatAddr);
-    }
-  }
-
-  else if (state == saveCache) {
-    if (debug())
-      DPRINTF(WindowManager, "State: saveCache\n");
-
-    currentCoreHash = 0;
-    saveCacheCoreAddr = currentComputationCoreAddr;
-    currentCacheEntryIndex = 0;
-    saveCacheEntryStat = computedResult;
-
-    state = saveCache_RequestCoreStart;
-  } else if (state == saveCache_RequestCoreStart) {
-    if (debug())
-      DPRINTF(WindowManager, "State: saveCache_RequestCoreStart\n");
-
-    assert(saveCacheCoreAddr != 0);
-    Addr core_start = saveCacheCoreAddr + 0;
-
-    if (GlobalPort *memory_port = owner->getValidGlobalPort(core_start, true)) {
-      MemoryRequest *read_req =
-          owner->readFromPort(memory_port, core_start, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = saveCache_WaitingCoreStart;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, core_start);
-    }
-  } else if (state == saveCache_RequestCoreEnd) {
-    if (debug())
-      DPRINTF(WindowManager, "State: saveCache_RequestCoreEnd\n");
-
-    assert(saveCacheCoreAddr != 0);
-    Addr core_end = saveCacheCoreAddr + owner->tsDataSize;
-
-    if (GlobalPort *memory_port = owner->getValidGlobalPort(core_end, true)) {
-      MemoryRequest *read_req =
-          owner->readFromPort(memory_port, core_end, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = saveCache_WaitingCoreEnd;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, core_end);
-    }
-  } else if (state == saveCache_RequestEmptyEntry) {
-    if (debug())
-      DPRINTF(WindowManager, "State: saveCache_RequestEmptyEntry\n");
-
-    assert(currentCoreHash != 0);
-
-    Addr cache_entry_hash_addr = owner->spmAddr +
-                                 currentCacheEntryIndex * cacheEntrySize +
-                                 owner->tsDataSize;
-
-    if (SPMPort *spm_port = owner->getValidSPMPort(cache_entry_hash_addr)) {
-      MemoryRequest *read_req = owner->readFromPort(
-          spm_port, cache_entry_hash_addr, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-
-      state = saveCache_WaitingEmptyEntry;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a spm port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, cache_entry_hash_addr);
-    }
-  } else if (state == saveCache_SaveCacheEntry) {
-    if (debug())
-      DPRINTF(WindowManager, "State: saveCache_SaveCacheEntry\n");
-
-    Addr cache_entry_tick_addr =
-        owner->spmAddr + currentCacheEntryIndex * cacheEntrySize;
-    Addr cache_entry_hash_addr = owner->spmAddr +
-                                 currentCacheEntryIndex * cacheEntrySize +
-                                 owner->tsDataSize;
-    Addr cache_entry_stat_addr = owner->spmAddr +
-                                 currentCacheEntryIndex * cacheEntrySize +
-                                 coreStatOffset;
-
-    if (SPMPort *spm_port =
-            owner->getValidSPMPort(cache_entry_tick_addr, false)) {
-      MemoryRequest *write_req =
-          owner->writeToPort(spm_port, curTick(), cache_entry_tick_addr);
-      owner->activeTimeseriesWindowRequests[this].push_back(write_req);
-
-      write_req =
-          owner->writeToPort(spm_port, currentCoreHash, cache_entry_hash_addr);
-      owner->activeTimeseriesWindowRequests[this].push_back(write_req);
-
-      write_req = owner->writeToPort(spm_port, saveCacheEntryStat,
-                                     cache_entry_stat_addr);
-      owner->activeTimeseriesWindowRequests[this].push_back(write_req);
-
-      currentComputationCoreAddr = 0;
-      computedResult = 0;
-      saveCacheEntryStat = 0;
-      state = initTraverse;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to write entry to 0x%016x\n",
-                cache_entry_tick_addr);
-    }
-  } else if (state == saveCache_Replace) {
-    if (debug())
-      DPRINTF(WindowManager, "State: saveCache_Replace\n");
-
-    Addr cache_entry_tick_addr =
-        owner->spmAddr + minCacheEntryIndex * cacheEntrySize;
-    Addr cache_entry_hash_addr = owner->spmAddr +
-                                 minCacheEntryIndex * cacheEntrySize +
-                                 owner->tsDataSize;
-    Addr cache_entry_stat_addr =
-        owner->spmAddr + minCacheEntryIndex * cacheEntrySize + coreStatOffset;
-
-    if (SPMPort *spm_port =
-            owner->getValidSPMPort(cache_entry_tick_addr, false)) {
-      MemoryRequest *write_req =
-          owner->writeToPort(spm_port, curTick(), cache_entry_tick_addr);
-      owner->activeTimeseriesWindowRequests[this].push_back(write_req);
-
-      write_req =
-          owner->writeToPort(spm_port, currentCoreHash, cache_entry_hash_addr);
-      owner->activeTimeseriesWindowRequests[this].push_back(write_req);
-
-      write_req = owner->writeToPort(spm_port, saveCacheEntryStat,
-                                     cache_entry_stat_addr);
-      owner->activeTimeseriesWindowRequests[this].push_back(write_req);
-
-      currentComputationCoreAddr = 0;
-      minCacheEntryAccessTick = UINT64_MAX;
-      minCacheEntryIndex = -1;
-      saveCacheCoreAddr = 0;
-      state = initTraverse;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to write entry to 0x%016x\n",
-                cache_entry_tick_addr);
     }
   }
 
@@ -1125,7 +774,7 @@ void WindowManager::timeseriesTick() {
     uint64_t a, b;
     while (file_stream >> a) {
       file_stream >> b;
-      requests.push((TimeseriesPERequest){a, b});
+      requests.push((TimeseriesRange){a, b});
     }
     DPRINTF(WindowManager, "requests size %d\n", requests.size());
 
@@ -1153,8 +802,8 @@ void WindowManager::timeseriesTick() {
       for (auto &pe_req : pair.second) {
         TimeseriesWindow *w = new TimeseriesWindow(
             this, corrensponding_pe_port, activeTimeseriesWindows.size());
-        w->setTimeseriesPERequest(pe_req.startTimestamp);
-        w->setTimeseriesPERequest(pe_req.endTimestamp);
+        w->setTimeseriesPERequest(pe_req.start);
+        w->setTimeseriesPERequest(pe_req.end);
         // window should not already exist in active windows
         assert(std::find(activeTimeseriesWindows.begin(),
                          activeTimeseriesWindows.end(),
@@ -1177,22 +826,24 @@ void WindowManager::timeseriesTick() {
             numCacheReplacements);
 
     DPRINTF(WindowManager, "cache dist\n");
-    for (auto &tup : fairyCache) {
-      DPRINTF(WindowManager, "tick %d\n", std::get<0>(tup));
-      DPRINTF(WindowManager, "addr 0x%016x\n", std::get<1>(tup));
-      DPRINTF(WindowManager, "stat %d\n", std::get<2>(tup));
-    }
+    // for (auto &tup : timeseriesCache) {
+    //   DPRINTF(WindowManager, "tick %d\n", std::get<0>(tup));
+    //   DPRINTF(WindowManager, "addr 0x%016x\n", std::get<1>(tup));
+    //   DPRINTF(WindowManager, "stat %d\n", std::get<2>(tup));
+    // }
 
-    for (auto &e : missAddrCount) {
-      DPRINTF(WindowManager, "miss addr 0x%016x count %d\n", e.first, e.second);
-    }
-    for (auto &e : hitAddrCount) {
-      DPRINTF(WindowManager, "hit addr 0x%016x count %d\n", e.first, e.second);
-    }
-    for (auto &e : replaceAddrCount) {
-      DPRINTF(WindowManager, "replace addr 0x%016x count %d\n", e.first,
-              e.second);
-    }
+    // for (auto &e : missAddrCount) {
+    //   DPRINTF(WindowManager, "miss addr 0x%016x count %d\n", e.first,
+    //   e.second);
+    // }
+    // for (auto &e : hitAddrCount) {
+    //   DPRINTF(WindowManager, "hit addr 0x%016x count %d\n", e.first,
+    //   e.second);
+    // }
+    // for (auto &e : replaceAddrCount) {
+    //   DPRINTF(WindowManager, "replace addr 0x%016x count %d\n", e.first,
+    //           e.second);
+    // }
 
     *mmr &= 0xfc;
     *mmr |= 0x04;
@@ -1280,9 +931,9 @@ void WindowManager::TimeseriesWindow::handleMemoryResponseData(uint64_t data) {
               "State: waitingChildAddr; the child address is 0x%016x\n", data);
 
     coreQueue.push(data);
-    scanChildrenIndices.pop();
+    childrenPointers.pop_front();
 
-    if (scanChildrenIndices.empty()) {
+    if (childrenPointers.empty()) {
       state = requestCoreStart;
     } else {
       state = requestChildAddr;
@@ -1302,6 +953,10 @@ void WindowManager::TimeseriesWindow::handleMemoryResponseData(uint64_t data) {
         if (debug())
           DPRINTF(WindowManager,
                   "done one computation core with present stat\n");
+
+        if (useCache())
+          saveCacheFunction(currentComputationCoreAddr, data);
+
         endResults.push_back(data);
         state = initTraverse;
       }
@@ -1423,118 +1078,15 @@ void WindowManager::TimeseriesWindow::handleMemoryResponseData(uint64_t data) {
       endResults.push_back(computedResult);
       traverseStackHead = std::pair<Addr, bool>();
 
-      // alternate cache/no cache
-      // if (useCache()) {
-      //   state = saveCache;
-      // } else {
+      // TODO: only adds CCs to cache
+      if (useCache())
+        saveCacheFunction(currentComputationCoreAddr, computedResult);
+
       currentComputationCoreAddr = 0;
       state = initTraverse;
-      // }
     } else {
-      // if (useCache()) {
-      //   state = saveCache;
-      // } else {
       computedResult = 0;
       state = requestStat;
-      // }
-    }
-  }
-
-  else if (state == checkCache_WaitingCoreStart) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "State: checkCache_WaitingCoreStart; the start is 0x%016x\n",
-              data);
-
-    if (debug())
-      DPRINTF(WindowManager, "hash before 0x%016x ", currentCoreHash);
-    currentCoreHash ^= data;
-    if (debug())
-      DPRINTF(WindowManager, "hash after 0x%016x\n", currentCoreHash);
-    state = checkCache_RequestCoreEnd;
-  } else if (state == checkCache_WaitingCoreEnd) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "State: checkCache_WaitingCoreEnd; the end is 0x%016x\n", data);
-
-    if (debug())
-      DPRINTF(WindowManager, "hash before 0x%016x ", currentCoreHash);
-    // currentCoreHash ^= data;
-    currentCoreHash = checkCacheCoreAddr;
-    if (debug())
-      DPRINTF(WindowManager, "hash after 0x%016x\n", currentCoreHash);
-    state = checkCache_RequestEntry;
-  } else if (state == checkCache_WaitingEntry) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "State: checkCache_WaitingEntry; the meta info is 0x%016x\n",
-              data);
-
-    if (currentCoreHash == data) {
-      state = checkCache_RequestFoundEntryStat;
-    } else {
-      if (currentCacheEntryIndex == maxCacheIndex - 1) {
-        state = checkCache_NotFound;
-      } else {
-        currentCacheEntryIndex++;
-        state = checkCache_RequestEntry;
-      }
-    }
-  } else if (state == checkCache_WaitingFoundEntryStat) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "State: checkCache_WaitingFoundEntryStat; the result is "
-              "0x%016x\n",
-              data);
-
-    endResults.push_back(data);
-    state = checkCache_UpdateFoundEntryAccessTick;
-  }
-
-  else if (state == saveCache_WaitingCoreStart) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "State: saveCache_WaitingCoreStart; the start is 0x%016x\n",
-              data);
-
-    if (debug())
-      DPRINTF(WindowManager, "hash before 0x%016x ", currentCoreHash);
-    currentCoreHash ^= data;
-    if (debug())
-      DPRINTF(WindowManager, "hash after 0x%016x\n", currentCoreHash);
-    state = saveCache_RequestCoreEnd;
-  } else if (state == saveCache_WaitingCoreEnd) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "State: saveCache_WaitingCoreEnd; the end is 0x%016x\n", data);
-
-    if (debug())
-      DPRINTF(WindowManager, "hash before 0x%016x ", currentCoreHash);
-    // currentCoreHash ^= data;
-    currentCoreHash = saveCacheCoreAddr;
-    if (debug())
-      DPRINTF(WindowManager, "hash after 0x%016x\n", currentCoreHash);
-    currentCacheEntryIndex = 0;
-    state = saveCache_RequestEmptyEntry;
-  } else if (state == saveCache_WaitingEmptyEntry) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "State: saveCache_WaitingEmptyEntry; the hash is 0x%016x\n",
-              data);
-
-    if (data == 0) {
-      state = saveCache_SaveCacheEntry;
-    } else {
-      if (currentCacheEntryIndex == maxCacheIndex - 1) {
-        state = saveCache_Replace;
-      } else {
-        if (data <= minCacheEntryAccessTick) {
-          minCacheEntryAccessTick = data;
-          minCacheEntryIndex = currentCacheEntryIndex;
-        }
-        currentCacheEntryIndex++;
-        state = saveCache_RequestEmptyEntry;
-      }
     }
   }
 }
@@ -1569,15 +1121,14 @@ void WindowManager::handleTimeseriesMemoryResponse(PacketPtr pkt,
 }
 
 void WindowManager::TimeseriesWindow::setTimeseriesPERequest(uint64_t value) {
-  if (peRequest.startTimestamp == UINT64_MAX)
-    peRequest.startTimestamp = value;
-  else if (peRequest.endTimestamp == UINT64_MAX) {
-    peRequest.endTimestamp = value;
-    coreQueue.push(tsCoresStartAddr);
+  if (initialQuery.start == UINT64_MAX)
+    initialQuery.start = value;
+  else if (initialQuery.end == UINT64_MAX) {
+    initialQuery.end = value;
+
     if (debug())
-      DPRINTF(WindowManager,
-              "new TS window created with range: 0x%016x 0x%016x\n",
-              peRequest.startTimestamp, peRequest.endTimestamp);
+      DPRINTF(WindowManager, "new TS window created with range: %d %d\n",
+              initialQuery.start, initialQuery.end);
 
     owner->requestPEActiveTimeseriesWindows[correspondingPEPort->getStartAddr()]
         .push_back(this);
@@ -1585,7 +1136,7 @@ void WindowManager::TimeseriesWindow::setTimeseriesPERequest(uint64_t value) {
       DPRINTF(WindowManager, "added this window to req PE addr 0x%016x\n",
               correspondingPEPort->getStartAddr());
 
-    state = requestCoreStart;
+    state = checkCache;
   } else
     panic("Calling setTimeseriesPERequest when you should not!\n");
 }

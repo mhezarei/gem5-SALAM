@@ -19,13 +19,10 @@ private:
   inline static const size_t peRequestLength = 8;
   inline static const size_t tsDataSize = 8;
   inline static const size_t signalDataSize = 4;
-  inline static const uint64_t endToken = 0xFFFFFFFFFFFFFFFF;
+  inline static const uint64_t endToken = UINT64_MAX;
   inline static const Addr spmAddr = 0x10021080;
-  inline static const size_t spmSize = 16 * 1024 * 1024;
+  inline static const size_t spmSize = 1024 * 1024;
   inline static const std::string operatingMode = "timeseries";
-  // TODO: clean this up please
-  inline static const size_t cacheEntrySize = 24;
-  inline static const bool fixedCache = false;
   inline static const bool fakeValues = true;
 
   inline static const size_t numPerPERequests = 1000;
@@ -55,10 +52,22 @@ private:
     uint16_t startElement;
     uint16_t length;
   };
-  struct TimeseriesPERequest {
-    uint64_t startTimestamp = UINT64_MAX;
-    uint64_t endTimestamp = UINT64_MAX;
+  struct TimeseriesRange {
+    uint64_t start = UINT64_MAX;
+    uint64_t end = UINT64_MAX;
+
+    bool operator<(const TimeseriesRange &other) const {
+      return std::make_pair(start, end) <
+             std::make_pair(other.start, other.end);
+    }
+
+    bool operator==(const TimeseriesRange &other) const {
+      return start == other.start && end == other.end;
+    }
   };
+  typedef std::tuple<size_t, TimeseriesRange, uint64_t> CacheEntry;
+  // TODO: clean this up please
+  inline static const size_t cacheEntrySize = sizeof(CacheEntry);
   typedef uint64_t Offset;
 
   class SPMPort : public ScratchpadRequestPort {
@@ -161,30 +170,20 @@ private:
 
   class TimeseriesWindow {
   private:
-    inline static const bool shouldUseCache = false;
-    inline static const std::string cacheInUse = "fairy";
-    inline static const size_t batchSize = 64;
-    inline static const size_t numChildren = 64;
-    inline static const size_t cacheEntrySize = 24;
+    inline static const std::string cacheType = "normal";
+    inline static const size_t batchSize = 4;
+    inline static const size_t numChildren = 4;
     inline static const Addr tsCoresStartAddr = 0x80c00000;
     /*
-      8KB data: 0x80c00118 - 0x80c00498
-      64MB data: 0x80c0a218 - 0x80ca2218
-      1GB data: 0x856aaa98 - 0x936aaa98
-      4GB data: 0x81622218 - 0x8ae22218
-
-      F64B64: 0x80e20818 - 0x89420818
       F4B4: 0x856aaa98 - 0x936aaa98
       F8B8: 0x82524918 - 0x8d524918
       F16B16: 0x81622218 - 0x8ae22218
       F32B32: 0x81508418 - 0x92d08418
+      F64B64: 0x80e20818 - 0x89420818
+      small: 0x80c00118 - 0x80c00498
     */
-    inline static const Addr leafCoresStartAddr = 0x80e20818;
-    inline static const Addr leafCoresEndAddr = 0x89420818;
-    /*
-      Ideal: leaf cores end addr
-    */
-    inline static const Addr lastCachedAddr = 0x92d08418;
+    inline static const Addr leafCoresStartAddr = 0x856aaa98;
+    inline static const Addr leafCoresEndAddr = 0x936aaa98;
 
     inline static const size_t coreRangeStartOffset = 0;
     inline static const size_t coreRangeEndOffset = tsDataSize;
@@ -192,6 +191,8 @@ private:
 
     enum State {
       none,
+
+      checkCache,
 
       requestCoreStart,
       waitingCoreStart,
@@ -208,30 +209,6 @@ private:
       startTraverse,
       requestTraverseChildren,
       waitingTraverseChildren,
-
-      checkCache,
-      checkCache_RequestCoreStart,
-      checkCache_WaitingCoreStart,
-      checkCache_RequestCoreEnd,
-      checkCache_WaitingCoreEnd,
-      checkCache_RequestEntry,
-      checkCache_WaitingEntry,
-      checkCache_RequestFoundEntryStat,
-      checkCache_WaitingFoundEntryStat,
-      checkCache_UpdateFoundEntryAccessTick,
-      checkCache_NotFound,
-
-      saveCache,
-      saveCache_RequestCoreStart,
-      saveCache_WaitingCoreStart,
-      saveCache_RequestCoreEnd,
-      saveCache_WaitingCoreEnd,
-      saveCache_RequestEmptyEntry,
-      saveCache_WaitingEmptyEntry,
-      saveCache_RequestCoreStat,
-      saveCache_WaitingCoreStat,
-      saveCache_SaveCacheEntry,
-      saveCache_Replace,
 
       computeStat,
       computeStat_RequestLeafValuesStartAddr,
@@ -250,9 +227,12 @@ private:
 
     std::string windowName;
     WindowManager *owner;
-    TimeseriesPERequest peRequest;
+
+    TimeseriesRange initialQuery;
+    std::vector<TimeseriesRange> subQueries;
+
     PEPort *correspondingPEPort;
-    std::queue<Addr> computationCores;
+    std::deque<Addr> computationCores;
     std::queue<std::pair<Addr, uint64_t>> partials;
     std::queue<Addr> coreQueue;
     int numReceivedChildren;
@@ -260,7 +240,7 @@ private:
     uint64_t currentCoreStart, currentCoreEnd;
     Addr currentComputationCoreAddr;
 
-    std::queue<size_t> scanChildrenIndices;
+    std::deque<Addr> childrenPointers;
 
     // traversal info
     std::pair<Addr, uint64_t> currentPartial;
@@ -270,16 +250,6 @@ private:
     Addr computeStatChildAddr;
     uint64_t computedResult;
     uint64_t numCheckedNodes;
-
-    // cache-related info
-    size_t maxCacheIndex;
-    Addr currentCoreHash;
-    size_t currentCacheEntryIndex;
-    Addr saveCacheCoreAddr;
-    Addr saveCacheEntryStat;
-    Addr checkCacheCoreAddr;
-    Tick minCacheEntryAccessTick;
-    size_t minCacheEntryIndex;
 
     // Tkh, koosi sher
     PEPort *connectedCalcPort;
@@ -291,7 +261,7 @@ private:
     std::string name() const { return windowName; }
     bool samePEPort(PEPort *pe_port) { return correspondingPEPort == pe_port; }
     bool waitingToStart() { return state == none; }
-    TimeseriesPERequest getPERequest() { return peRequest; }
+    TimeseriesRange getPERequest() { return initialQuery; }
     void firstScanTick();
     void traverseTick();
     void handleMemoryResponseData(uint64_t data);
@@ -301,11 +271,10 @@ private:
     bool coresDone() {
       return traverseStack.empty() && computationCores.empty();
     }
-    bool useCache() { return shouldUseCache; }
-    bool fairyCacheInUse() { return cacheInUse == "fairy"; }
-    bool realCacheInUse() { return cacheInUse == "real"; }
-    bool checkCacheFunction();
-    void saveCacheFunction();
+    bool useCache() { return cacheType != ""; }
+    bool useIdealCache() { return cacheType == "ideal"; }
+    void checkCacheFunction();
+    void saveCacheFunction(Addr cc_address, uint64_t cc_stat);
   };
 
   class SignalWindow {
@@ -363,17 +332,23 @@ private:
 
   // Tkh, koosi sher
   std::map<Addr, bool> calcStatus;
-  std::queue<TimeseriesPERequest> requests;
-  std::map<Addr, std::vector<TimeseriesPERequest>> perPERequests;
+  std::queue<TimeseriesRange> requests;
+  std::map<Addr, std::vector<TimeseriesRange>> perPERequests;
+  std::map<Addr, TimeseriesRange> ccAddressToRange;
 
-  // Fairy cache
-  std::vector<std::tuple<Tick, Addr, uint64_t>> fairyCache;
+  // Timeseries cache
+  // based on number of accesses
+  std::vector<CacheEntry> timeseriesCache;
+  // LRU
+  // std::vector<std::tuple<Tick, TimeseriesRange, uint64_t>>
+  // timeseriesCache;
   size_t numCacheAccesses, numCacheHits, numCacheMisses, numCacheReplacements,
       numCacheInsertions;
-  std::map<Addr, size_t> missAddrCount;
-  std::map<Addr, size_t> hitAddrCount;
-  std::map<Addr, size_t> replaceAddrCount;
+  std::map<TimeseriesRange, size_t> missedRanges;
+  std::map<TimeseriesRange, size_t> hitRanges;
+  std::map<TimeseriesRange, size_t> replacedRanges;
   std::vector<Addr> fixedCacheAddresses;
+  size_t maxCacheIndex;
 
   // data structures
   std::vector<MemoryRequest *> activeReadRequests;
@@ -445,7 +420,7 @@ private:
       }
     }
   }
-  bool useFixedCache() { return fixedCache; }
+  bool isCacheFull() { return timeseriesCache.size() == maxCacheIndex + 1; }
 
 public:
   WindowManager(const WindowManagerParams &p);
