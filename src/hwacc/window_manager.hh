@@ -65,7 +65,11 @@ private:
       return start == other.start && end == other.end;
     }
   };
-  typedef std::tuple<size_t, TimeseriesRange, uint64_t> CacheEntry;
+  struct CacheEntry {
+    size_t numAccesses;
+    TimeseriesRange range;
+    uint64_t stat;
+  };
   // TODO: clean this up please
   inline static const size_t cacheEntrySize = sizeof(CacheEntry);
   typedef uint64_t Offset;

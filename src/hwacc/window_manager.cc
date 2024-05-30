@@ -300,12 +300,12 @@ void WindowManager::TimeseriesWindow::checkCacheFunction() {
       }
     }
   } else {
-    for (auto &tup : owner->timeseriesCache) {
-      uint64_t entry_start = std::get<1>(tup).start;
-      uint64_t entry_end = std::get<1>(tup).end;
+    for (auto &entry : owner->timeseriesCache) {
+      uint64_t entry_start = entry.range.start;
+      uint64_t entry_end = entry.range.end;
 
       if (entry_start >= initialQuery.start && entry_end <= initialQuery.end) {
-        nominated_ranges.push_back(std::get<1>(tup));
+        nominated_ranges.push_back(entry.range);
       }
     }
   }
@@ -343,15 +343,15 @@ void WindowManager::TimeseriesWindow::checkCacheFunction() {
 
   // step 3: add hit results
   for (auto &e : largest_ranges) {
-    for (auto &tup : owner->timeseriesCache) {
-      TimeseriesRange entry_range = std::get<1>(tup);
+    for (auto &entry : owner->timeseriesCache) {
+      TimeseriesRange entry_range = entry.range;
       if (e == entry_range) {
         if (debug())
           DPRINTF(WindowManager, "found a covered range inside cache %d-%d\n",
                   entry_range.start, entry_range.end);
 
-        std::get<0>(tup) = std::get<0>(tup) + 1;
-        endResults.push_back(std::get<2>(tup));
+        entry.numAccesses = entry.numAccesses + 1;
+        endResults.push_back(entry.stat);
 
         owner->numCacheHits++;
         owner->hitRanges[entry_range]++;
@@ -390,14 +390,13 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
 
   // case 1: cc address already in cache -> increase hit number
   for (auto &entry : owner->timeseriesCache) {
-    TimeseriesRange entry_range = std::get<1>(entry);
-    if (entry_range == cc_range) {
+    if (entry.range == cc_range) {
       if (debug())
         DPRINTF(WindowManager,
                 "request address already exists in cache; updating\n");
 
-      std::get<0>(entry) = std::get<0>(entry) + 1;
-      std::get<2>(entry) = cc_stat;
+      entry.numAccesses = entry.numAccesses + 1;
+      entry.stat = cc_stat;
       return;
     }
   }
@@ -407,7 +406,7 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
     if (debug())
       DPRINTF(WindowManager, "cache not full; found empty entry\n");
 
-    owner->timeseriesCache.push_back(std::make_tuple(1, cc_range, cc_stat));
+    owner->timeseriesCache.push_back((CacheEntry){1, cc_range, cc_stat});
     return;
   }
 
@@ -415,21 +414,22 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
   // case 3: cc not in cache; cache full -> replace
   std::vector<TimeseriesRange> low_access_entries;
   // case 3.1: find min number of accesses
-  size_t min_num_accesses = UINT64_MAX;
-  for (auto &entry : owner->timeseriesCache) {
-    size_t entry_num_accesses = std::get<0>(entry);
-    if (entry_num_accesses < min_num_accesses)
-      min_num_accesses = entry_num_accesses;
-  }
+  size_t min_num_accesses =
+      (*std::min_element(owner->timeseriesCache.begin(),
+                         owner->timeseriesCache.end(),
+                         [](const CacheEntry &e1, const CacheEntry &e2) {
+                           return e1.numAccesses < e2.numAccesses;
+                         }))
+          .numAccesses;
   assert(min_num_accesses > 0);
   if (debug())
     DPRINTF(WindowManager, "in saving to cache, min num accesses in %d\n",
             min_num_accesses);
   // case 3.2: fill the nominated list
   for (auto &entry : owner->timeseriesCache) {
-    size_t entry_num_accesses = std::get<0>(entry);
+    size_t entry_num_accesses = entry.numAccesses;
     if (entry_num_accesses == min_num_accesses)
-      low_access_entries.push_back(std::get<1>(entry));
+      low_access_entries.push_back(entry.range);
   }
   // case 3.3: sort nominated list
   // current algo: based on range size
@@ -454,14 +454,13 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
   }
 
   for (auto &entry : owner->timeseriesCache) {
-    TimeseriesRange entry_range = std::get<1>(entry);
-    if (entry_range == low_access_entries.front()) {
+    if (entry.range == low_access_entries.front()) {
       if (debug())
         DPRINTF(WindowManager, "cache full; replaced smallest range\n");
 
-      std::get<0>(entry) = 1;
-      std::get<1>(entry) = cc_range;
-      std::get<2>(entry) = cc_stat;
+      entry.numAccesses = 1;
+      entry.range = cc_range;
+      entry.stat = cc_stat;
       return;
     }
   }
