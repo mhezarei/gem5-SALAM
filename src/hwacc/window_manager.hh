@@ -21,12 +21,12 @@ private:
   inline static const size_t signalDataSize = 4;
   inline static const uint64_t endToken = UINT64_MAX;
   inline static const Addr spmAddr = 0x10021080;
-  inline static const size_t spmSize = 1024 * 1024;
+  inline static const size_t spmSize = 64 * 1024;
   inline static const std::string operatingMode = "timeseries";
-  inline static const bool fakeValues = true;
+  inline static const bool fakeValues = false;
 
-  inline static const size_t numPerPERequests = 1000;
-  inline static const size_t perRequestPEConcurrentTimeseriesWindows = 4;
+  inline static const size_t numPerPERequests = 1024;
+  inline static const size_t perRequestPEConcurrentTimeseriesWindows = 8;
   inline static const std::vector<Addr> calcAddresses = {
       0x100201c0, 0x10020240, 0x100202c0, 0x10020340, 0x100203c0, 0x10020440,
       0x100204c0, 0x10020540, 0x100205c0, 0x10020640, 0x100206c0, 0x10020740,
@@ -38,12 +38,23 @@ private:
       0x100216c0, 0x10021740, 0x100217c0, 0x10021840, 0x100218c0, 0x10021940,
       0x100219c0, 0x10021a40, 0x10021ac0, 0x10021b40, 0x10021bc0, 0x10021c40,
       0x10021cc0, 0x10021d40, 0x10021dc0, 0x10021e40, 0x10021ec0, 0x10021f40,
-      0x10021fc0, 0x10022040, 0x100220c0, 0x10022140,
+      0x10021fc0, 0x10022040, 0x100220c0, 0x10022140, 0x100221c0, 0x10022240,
+      0x100222c0, 0x10022340, 0x100223c0, 0x10022440, 0x100224c0, 0x10022540,
+      0x100225c0, 0x10022640, 0x100226c0, 0x10022740, 0x100227c0, 0x10022840,
+      0x100228c0, 0x10022940, 0x100229c0, 0x10022a40, 0x10022ac0, 0x10022b40,
+      0x10022bc0, 0x10022c40, 0x10022cc0, 0x10022d40, 0x10022dc0, 0x10022e40,
+      0x10022ec0, 0x10022f40, 0x10022fc0, 0x10023040, 0x100230c0, 0x10023140,
+      0x100231c0, 0x10023240, 0x100232c0, 0x10023340, 0x100233c0, 0x10023440,
+      0x100234c0, 0x10023540, 0x100235c0, 0x10023640, 0x100236c0, 0x10023740,
+      0x100237c0, 0x10023840, 0x100238c0, 0x10023940, 0x100239c0, 0x10023a40,
+      0x10023ac0, 0x10023b40, 0x10023bc0, 0x10023c40, 0x10023cc0, 0x10023d40,
+      0x10023dc0, 0x10023e40, 0x10023ec0, 0x10023f40, 0x10023fc0, 0x10024040,
+      0x100240c0, 0x10024140,
   };
   inline static const std::vector<Addr> reqPEAddresses = {
-      0x10027b40, 0x10027c80, 0x10027dc0, 0x10027f00, 0x10028040, 0x10028180,
-      0x100282c0, 0x10028400, 0x10028540, 0x10028680, 0x100287c0, 0x10028900,
-      0x10028a40, 0x10028b80, 0x10028cc0, 0x10028e00,
+      0x1002eb40, 0x1002ec80, 0x1002edc0, 0x1002ef00, 0x1002f040, 0x1002f180,
+      0x1002f2c0, 0x1002f400, 0x1002f540, 0x1002f680, 0x1002f7c0, 0x1002f900,
+      0x1002fa40, 0x1002fb80, 0x1002fcc0, 0x1002fe00,
   };
 
 private:
@@ -111,6 +122,7 @@ private:
 
   protected:
     WindowManager *owner;
+    PacketPtr waitingResponsePkt;
 
   public:
     GenericRequestPort(const std::string &name, WindowManager *owner,
@@ -123,6 +135,7 @@ private:
     void addRetryPacket(PacketPtr pkt) { retryPackets.push(pkt); }
     bool hasRetryPackets() { return !retryPackets.empty(); }
     Addr getStartAddr() { return (*getAddrRanges().begin()).start(); }
+    bool waitingForResponse() { return waitingResponsePkt != nullptr; }
 
     virtual bool recvTimingResp(PacketPtr pkt);
     virtual void recvReqRetry();
@@ -184,6 +197,7 @@ private:
       F16B16: 0x81622218 - 0x8ae22218
       F32B32: 0x81508418 - 0x92d08418
       F64B64: 0x80e20818 - 0x89420818
+      F64B4: 0x80e20818 - 0x89420818
       small: 0x80c00118 - 0x80c00498
     */
     inline static const Addr leafCoresStartAddr = 0x856aaa98;
@@ -341,13 +355,10 @@ private:
   std::map<Addr, TimeseriesRange> ccAddressToRange;
 
   // Timeseries cache
-  // based on number of accesses
   std::vector<CacheEntry> timeseriesCache;
-  // LRU
-  // std::vector<std::tuple<Tick, TimeseriesRange, uint64_t>>
-  // timeseriesCache;
   size_t numCacheAccesses, numCacheHits, numCacheMisses, numCacheReplacements,
       numCacheInsertions;
+  float avgSavedPortion;
   std::map<TimeseriesRange, size_t> missedRanges;
   std::map<TimeseriesRange, size_t> hitRanges;
   std::map<TimeseriesRange, size_t> replacedRanges;

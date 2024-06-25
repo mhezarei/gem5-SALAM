@@ -343,7 +343,7 @@ class AccCluster:
         lines.append("	system.iobus.mem_side_ports = clstr.local_bus.cpu_side_ports")
         # Need to define l2coherency in the YAML file?
         lines.append(
-            "	clstr._connect_caches(system, options, l2coherent=False, cache_size='16MiB')"
+            "	clstr._connect_caches(system, options, l2coherent=True, cache_size='16MiB')"
         )
         # lines.append("	clstr.cluster_cache.assoc = 16")
         lines.append("	gic = system.realview.gic")
@@ -379,7 +379,7 @@ class WindowManager:
 
         lines.append("# " + self.name + " Config")
         lines.append(f"clstr.{self.name}.local = clstr.local_bus.cpu_side_ports")
-        for _ in range(self.num_mem_ports):
+        for _ in range(4 * self.num_mem_ports):
             lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
         lines.append(f"clstr.{self.name}.pio = clstr.local_bus.mem_side_ports")
         lines.append(f"clstr.{self.name}.debug_enabled = {str(self.debug)}")

@@ -5,7 +5,8 @@
 #include "mem/packet_access.hh"
 #include "sim/system.hh"
 #include <algorithm>
-
+#include <iterator>
+#include <random>
 #include <string>
 
 WindowManager::WindowManager(const WindowManagerParams &p)
@@ -25,6 +26,7 @@ WindowManager::WindowManager(const WindowManagerParams &p)
   numCacheMisses = 0;
   numCacheReplacements = 0;
   numCacheInsertions = 0;
+  avgSavedPortion = 0;
   maxCacheIndex = ((size_t)(spmSize / cacheEntrySize - 1));
 
   // dummy values for testing!!!
@@ -59,6 +61,7 @@ void WindowManager::recvPacket(PacketPtr pkt) {
       }
     } else if (GlobalPort *global_port =
                    dynamic_cast<GlobalPort *>(carrier_port)) {
+      global_port->waitingResponsePkt = nullptr;
       if (isSignalMode()) {
         handleSignalMemoryResponse(pkt, read_req);
       } else if (isTimeseriesMode()) {
@@ -85,6 +88,7 @@ void WindowManager::recvPacket(PacketPtr pkt) {
       removeSignalWindowRequest(write_req);
     } else if (PEPort *port = dynamic_cast<PEPort *>(carrier_port)) {
     } else if (GlobalPort *port = dynamic_cast<GlobalPort *>(carrier_port)) {
+      port->waitingResponsePkt = nullptr;
       handleTimeseriesMemoryResponse(pkt, write_req);
     } else {
       panic("Unknown port receiving the write response!\n");
@@ -117,6 +121,8 @@ void WindowManager::TimeseriesWindow::firstScanTick() {
     if (useCache()) {
       checkCacheFunction();
       if (subQueries.empty()) { // all the query is hit
+        if (debug())
+          DPRINTF(WindowManager, "ALL THE QUERY IS INSIDE CACHE\n");
         state = initTraverse;
         return;
       }
@@ -221,7 +227,20 @@ void WindowManager::TimeseriesWindow::firstScanTick() {
           DPRINTF(WindowManager, "children of 0x%016x %f-%f are needed\n",
                   currentCoreAddr, node_start, node_end);
 
+        // doing some high-level analytics to reduce the number of children
+        double current_node_size = node_end - node_start + 1;
+        double child_size = current_node_size / numChildren;
         for (size_t i = 0; i < numChildren; i++) {
+          double child_start = node_start + i * child_size;
+          double child_end = child_start + child_size - 1;
+          bool skip_child = (child_end < inp_start) || (child_start > inp_end);
+          if (skip_child) {
+            if (debug())
+              DPRINTF(WindowManager, "skipped child #%d %f-%f\n", i,
+                      child_start, child_end);
+            continue;
+          }
+
           Addr child_pointer = currentCoreAddr + (i + 3) * owner->tsDataSize;
           if (std::find(childrenPointers.begin(), childrenPointers.end(),
                         child_pointer) == childrenPointers.end()) {
@@ -342,23 +361,32 @@ void WindowManager::TimeseriesWindow::checkCacheFunction() {
   std::sort(largest_ranges.begin(), largest_ranges.end());
 
   // step 3: add hit results
+  float saved_portion = 0;
   for (auto &e : largest_ranges) {
     for (auto &entry : owner->timeseriesCache) {
       TimeseriesRange entry_range = entry.range;
       if (e == entry_range) {
         if (debug())
-          DPRINTF(WindowManager, "found a covered range inside cache %d-%d\n",
-                  entry_range.start, entry_range.end);
+          DPRINTF(WindowManager,
+                  "found a covered range inside cache %d-%d diff %d\n",
+                  entry_range.start, entry_range.end,
+                  entry_range.end - entry_range.start);
 
         entry.numAccesses = entry.numAccesses + 1;
         endResults.push_back(entry.stat);
 
+        saved_portion += (float)entry.range.end - (float)entry.range.start;
         owner->numCacheHits++;
         owner->hitRanges[entry_range]++;
         break;
       }
     }
   }
+  saved_portion /= (float)initialQuery.end - (float)initialQuery.start;
+  if (debug())
+    DPRINTF(WindowManager, "cache saved %f percent of the initial query\n",
+            saved_portion * 100);
+  owner->avgSavedPortion += 100 * saved_portion;
 
   // step 4: make subQueries
   uint64_t start = initialQuery.start;
@@ -407,6 +435,8 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
       DPRINTF(WindowManager, "cache not full; found empty entry\n");
 
     owner->timeseriesCache.push_back((CacheEntry){1, cc_range, cc_stat});
+
+    owner->numCacheInsertions++;
     return;
   }
 
@@ -461,6 +491,9 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
       entry.numAccesses = 1;
       entry.range = cc_range;
       entry.stat = cc_stat;
+
+      owner->numCacheReplacements++;
+      owner->replacedRanges[entry.range]++;
       return;
     }
   }
@@ -832,26 +865,29 @@ void WindowManager::timeseriesTick() {
             numCacheInsertions);
     DPRINTF(WindowManager, "Number of cache replacements: %lu\n",
             numCacheReplacements);
+    DPRINTF(WindowManager, "Avg saved portion: %f\n",
+            avgSavedPortion / (reqPEAddresses.size() * numPerPERequests));
 
     DPRINTF(WindowManager, "cache dist\n");
-    // for (auto &tup : timeseriesCache) {
-    //   DPRINTF(WindowManager, "tick %d\n", std::get<0>(tup));
-    //   DPRINTF(WindowManager, "addr 0x%016x\n", std::get<1>(tup));
-    //   DPRINTF(WindowManager, "stat %d\n", std::get<2>(tup));
-    // }
+    for (auto &entry : timeseriesCache) {
+      DPRINTF(WindowManager, "number of accesses: %d\n", entry.numAccesses);
+      DPRINTF(WindowManager, "range: %d-%d\n", entry.range.start,
+              entry.range.end);
+      DPRINTF(WindowManager, "stat: %d\n", entry.stat);
+    }
 
-    // for (auto &e : missAddrCount) {
-    //   DPRINTF(WindowManager, "miss addr 0x%016x count %d\n", e.first,
-    //   e.second);
-    // }
-    // for (auto &e : hitAddrCount) {
-    //   DPRINTF(WindowManager, "hit addr 0x%016x count %d\n", e.first,
-    //   e.second);
-    // }
-    // for (auto &e : replaceAddrCount) {
-    //   DPRINTF(WindowManager, "replace addr 0x%016x count %d\n", e.first,
-    //           e.second);
-    // }
+    for (auto &e : missedRanges) {
+      DPRINTF(WindowManager, "miss range %d-%d count %d\n", e.first.start,
+              e.first.end, e.second);
+    }
+    for (auto &e : hitRanges) {
+      DPRINTF(WindowManager, "hit range %d-%d count %d\n", e.first.start,
+              e.first.end, e.second);
+    }
+    for (auto &e : replacedRanges) {
+      DPRINTF(WindowManager, "replace range %d-%d count %d\n", e.first.start,
+              e.first.end, e.second);
+    }
 
     *mmr &= 0xfc;
     *mmr |= 0x04;
@@ -866,10 +902,6 @@ void WindowManager::timeseriesTick() {
   //     readFromPort(port, port->getStartAddr(), peRequestLength);
   //   }
   // }
-
-  if (debug())
-    DPRINTF(WindowManager, "Number of ongoing timeseries windows %d\n",
-            activeTimeseriesWindows.size());
 
   // advance timeseries windows by one
   for (auto &pair : requestPEActiveTimeseriesWindows) {
@@ -1372,6 +1404,9 @@ MemoryRequest *WindowManager::readFromPort(RequestPort *port, Addr addr,
     pe_port->sendPacket(pkt);
     activeReadRequests.push_back(read_req);
   } else if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(port)) {
+    assert(!memory_port->waitingForResponse());
+    memory_port->waitingResponsePkt = pkt;
+
     memory_port->sendPacket(pkt);
     activeReadRequests.push_back(read_req);
   } else if (SPMPort *spm_port = dynamic_cast<SPMPort *>(port)) {
@@ -1418,6 +1453,9 @@ MemoryRequest *WindowManager::writeToPort(RequestPort *req_port,
     port->sendPacket(pkt);
     activeWriteRequests.push_back(write_req);
   } else if (GlobalPort *port = dynamic_cast<GlobalPort *>(req_port)) {
+    assert(!port->waitingForResponse());
+    port->waitingResponsePkt = pkt;
+
     port->sendPacket(pkt);
     activeWriteRequests.push_back(write_req);
   } else {
@@ -1478,15 +1516,38 @@ Tick WindowManager::write(PacketPtr pkt) {
   return pioDelay;
 }
 
+template <typename Iter, typename RandomGenerator>
+Iter select_randomly(Iter start, Iter end, RandomGenerator &g) {
+  std::uniform_int_distribution<> dis(0, std::distance(start, end) - 1);
+  std::advance(start, dis(g));
+  return start;
+}
+
+template <typename Iter> Iter select_randomly(Iter start, Iter end) {
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  return select_randomly(start, end, gen);
+}
+
 WindowManager::GlobalPort *WindowManager::getValidGlobalPort(Addr add,
                                                              bool read) {
-  for (auto port : globalPorts) {
+  while (1) {
+    auto port = *select_randomly(globalPorts.begin(), globalPorts.end());
     AddrRangeList adl = port->getAddrRanges();
     for (auto address : adl)
-      if (address.contains(add) && !(port->hasRetryPackets()))
+      if (address.contains(add) && !(port->hasRetryPackets()) &&
+          !port->waitingForResponse())
         return port;
   }
-  return nullptr;
+
+  // for (auto port : globalPorts) {
+  //   AddrRangeList adl = port->getAddrRanges();
+  //   for (auto address : adl)
+  //     if (address.contains(add) && !(port->hasRetryPackets()) &&
+  //         !port->waitingForResponse())
+  //       return port;
+  // }
+  // return nullptr;
 }
 
 WindowManager::SPMPort *WindowManager::getValidSPMPort(Addr add, bool read) {
