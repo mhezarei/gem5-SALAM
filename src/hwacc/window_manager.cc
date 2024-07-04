@@ -116,186 +116,6 @@ WindowManager::TimeseriesWindow::TimeseriesWindow(WindowManager *owner,
     DPRINTF(WindowManager, "maxCacheIndex %d\n", owner->maxCacheIndex);
 }
 
-void WindowManager::TimeseriesWindow::firstScanTick() {
-  if (state == checkCache) {
-    if (useCache()) {
-      checkCacheFunction();
-      if (subQueries.empty()) { // all the query is hit
-        if (debug())
-          DPRINTF(WindowManager, "ALL THE QUERY IS INSIDE CACHE\n");
-        state = initTraverse;
-        return;
-      }
-    } else {
-      subQueries.push_back(initialQuery);
-    }
-
-    coreQueue.push(tsCoresStartAddr);
-    state = requestCoreStart;
-  } else if (state == requestCoreStart) {
-    if (debug())
-      DPRINTF(WindowManager, "State: requestCoreStart\n");
-
-    if (coreQueue.empty()) {
-      if (childrenPointers.empty()) { // done
-        state = firstScanDone;
-      } else { // have to cover children
-        state = requestChildAddr;
-      }
-      return;
-    }
-
-    currentCoreAddr = coreQueue.front();
-    Addr coreRangeStartAddr = currentCoreAddr + coreRangeStartOffset;
-
-    if (debug())
-      DPRINTF(WindowManager, "Core Start Addr: 0x%016x\n", currentCoreAddr);
-
-    if (GlobalPort *memory_port =
-            owner->getValidGlobalPort(coreRangeStartAddr, true)) {
-      MemoryRequest *read_req = owner->readFromPort(
-          memory_port, coreRangeStartAddr, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = waitingCoreStart;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, coreRangeStartAddr);
-      currentCoreAddr = 0;
-    }
-  } else if (state == requestCoreEnd) {
-    if (debug())
-      DPRINTF(WindowManager, "State: requestCoreEnd\n");
-
-    Addr coreRangeEndAddr = currentCoreAddr + coreRangeEndOffset;
-
-    if (debug())
-      DPRINTF(WindowManager, "Core End Addr: 0x%016x\n", coreRangeEndAddr);
-
-    if (GlobalPort *memory_port =
-            owner->getValidGlobalPort(coreRangeEndAddr, true)) {
-      MemoryRequest *read_req =
-          owner->readFromPort(memory_port, coreRangeEndAddr, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = waitingCoreEnd;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, coreRangeEndAddr);
-    }
-  } else if (state == checkRange) {
-    for (auto &sub_q : subQueries) {
-      uint64_t inp_start = sub_q.start;
-      uint64_t inp_end = sub_q.end;
-      double node_start, node_end;
-      memcpy(&node_start, &currentCoreStart, sizeof(node_start));
-      memcpy(&node_end, &currentCoreEnd, sizeof(node_end));
-
-      if (debug())
-        DPRINTF(WindowManager,
-                "Checking range inp_start:%d inp_end:%d against node_start:%f "
-                "node_end:%f\n",
-                inp_start, inp_end, node_start, node_end);
-
-      assert(node_start < node_end);
-
-      bool is_leaf = isLeafNode(currentCoreAddr);
-      bool case_skip = (node_start > inp_end) || (node_end < inp_start);
-      bool case_add_to_list = (inp_start <= node_start && node_end <= inp_end);
-
-      if (debug())
-        DPRINTF(WindowManager, "is leaf %d skip %d add %d\n", is_leaf,
-                case_skip, case_add_to_list);
-
-      if (case_skip) { // skip
-        state = requestCoreStart;
-      } else if (case_add_to_list) { // add to list
-        if (std::find(computationCores.begin(), computationCores.end(),
-                      currentCoreAddr) == computationCores.end()) {
-          if (debug())
-            DPRINTF(WindowManager, "added to CCs: 0x%016x %f-%f\n",
-                    currentCoreAddr, node_start, node_end);
-          computationCores.push_back(currentCoreAddr);
-          owner->ccAddressToRange[currentCoreAddr] =
-              (TimeseriesRange){(uint64_t)node_start, (uint64_t)node_end};
-        }
-        state = requestCoreStart;
-      } else if (!is_leaf) { // non-leaf & children
-        if (debug())
-          DPRINTF(WindowManager, "children of 0x%016x %f-%f are needed\n",
-                  currentCoreAddr, node_start, node_end);
-
-        // doing some high-level analytics to reduce the number of children
-        double current_node_size = node_end - node_start + 1;
-        double child_size = current_node_size / numChildren;
-        for (size_t i = 0; i < numChildren; i++) {
-          double child_start = node_start + i * child_size;
-          double child_end = child_start + child_size - 1;
-          bool skip_child = (child_end < inp_start) || (child_start > inp_end);
-          if (skip_child) {
-            if (debug())
-              DPRINTF(WindowManager, "skipped child #%d %f-%f\n", i,
-                      child_start, child_end);
-            continue;
-          }
-
-          Addr child_pointer = currentCoreAddr + (i + 3) * owner->tsDataSize;
-          if (std::find(childrenPointers.begin(), childrenPointers.end(),
-                        child_pointer) == childrenPointers.end()) {
-            childrenPointers.push_back(child_pointer);
-          }
-        }
-        state = requestCoreStart;
-      } else { // leaf & partial
-        double partial_start = fmax(inp_start, node_start);
-        double partial_diff = fabs(partial_start - fmin(inp_end, node_end));
-
-        Addr partial_start_addr =
-            currentCoreAddr +
-            ((uint64_t)(partial_start - node_start)) * coreStatOffset;
-        uint64_t partial_length = (uint64_t)partial_diff + 1;
-
-        if (debug())
-          DPRINTF(WindowManager,
-                  "added to partials 0x%016x, %d while on %f-%f\n",
-                  partial_start_addr, partial_length, node_start, node_end);
-
-        partials.push(std::make_pair(partial_start_addr, partial_length));
-        state = requestCoreStart;
-      }
-    }
-
-    if (!coreQueue.empty())
-      coreQueue.pop();
-  } else if (state == requestChildAddr) {
-    if (debug())
-      DPRINTF(WindowManager, "State: requestChildAddr\n");
-
-    Addr child_pointer = childrenPointers.front();
-
-    if (debug())
-      DPRINTF(WindowManager, "Requesting address for pointer 0x%016x\n",
-              child_pointer);
-
-    if (GlobalPort *memory_port =
-            owner->getValidGlobalPort(child_pointer, true)) {
-      MemoryRequest *read_req =
-          owner->readFromPort(memory_port, child_pointer, owner->tsDataSize);
-      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
-      state = waitingChildAddr;
-    } else {
-      if (debug())
-        DPRINTF(WindowManager,
-                "Did not find a global port to read %d bytes from 0x%016x\n",
-                owner->tsDataSize, child_pointer);
-    }
-  } else if (state == firstScanDone) {
-    state = initTraverse;
-  }
-}
-
 void WindowManager::TimeseriesWindow::checkCacheFunction() {
   if (debug())
     DPRINTF(WindowManager, "Checking the cache for the initial query %d %d\n",
@@ -429,13 +249,21 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
     }
   }
 
+  // limited special case: do not cache very small ranges
+  uint64_t cc_diff = cc_range.end - cc_range.start;
+  if (useLimitedCache() && cc_diff < limitedCacheMinDifference) {
+    if (debug())
+      DPRINTF(WindowManager, "cannot cache very small ranges (lower than %d)\n",
+              limitedCacheMinDifference);
+    return;
+  }
+
   // case 2: cc not in cache; cache has space -> add to cache
   if (!owner->isCacheFull()) {
     if (debug())
       DPRINTF(WindowManager, "cache not full; found empty entry\n");
 
     owner->timeseriesCache.push_back((CacheEntry){1, cc_range, cc_stat});
-
     owner->numCacheInsertions++;
     return;
   }
@@ -496,6 +324,187 @@ void WindowManager::TimeseriesWindow::saveCacheFunction(Addr cc_address,
       owner->replacedRanges[entry.range]++;
       return;
     }
+  }
+}
+
+void WindowManager::TimeseriesWindow::firstScanTick() {
+  if (state == checkCache) {
+    if (useCache()) {
+      checkCacheFunction();
+      if (subQueries.empty()) { // all the query is hit
+        if (debug())
+          DPRINTF(WindowManager, "ALL THE QUERY IS INSIDE CACHE\n");
+        state = initTraverse;
+        return;
+      }
+    } else {
+      subQueries.push_back(initialQuery);
+    }
+
+    coreQueue.push(tsCoresStartAddr);
+    state = requestCoreStart;
+  } else if (state == requestCoreStart) {
+    if (debug())
+      DPRINTF(WindowManager, "State: requestCoreStart\n");
+
+    if (coreQueue.empty()) {
+      if (childrenPointers.empty()) { // done
+        state = firstScanDone;
+      } else { // have to cover children
+        state = requestChildAddr;
+      }
+      return;
+    }
+
+    currentCoreAddr = coreQueue.front();
+    Addr coreRangeStartAddr = currentCoreAddr + coreRangeStartOffset;
+
+    if (debug())
+      DPRINTF(WindowManager, "Core Start Addr: 0x%016x\n", currentCoreAddr);
+
+    if (GlobalPort *memory_port =
+            owner->getValidGlobalPort(coreRangeStartAddr, true)) {
+      MemoryRequest *read_req = owner->readFromPort(
+          memory_port, coreRangeStartAddr, owner->tsDataSize);
+      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
+      state = waitingCoreStart;
+    } else {
+      if (debug())
+        DPRINTF(WindowManager,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, coreRangeStartAddr);
+      currentCoreAddr = 0;
+    }
+  } else if (state == requestCoreEnd) {
+    if (debug())
+      DPRINTF(WindowManager, "State: requestCoreEnd\n");
+
+    Addr coreRangeEndAddr = currentCoreAddr + coreRangeEndOffset;
+
+    if (debug())
+      DPRINTF(WindowManager, "Core End Addr: 0x%016x\n", coreRangeEndAddr);
+
+    if (GlobalPort *memory_port =
+            owner->getValidGlobalPort(coreRangeEndAddr, true)) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, coreRangeEndAddr, owner->tsDataSize);
+      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
+      state = waitingCoreEnd;
+    } else {
+      if (debug())
+        DPRINTF(WindowManager,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, coreRangeEndAddr);
+    }
+  } else if (state == checkRange) {
+    for (auto &sub_q : subQueries) {
+      uint64_t inp_start = sub_q.start;
+      uint64_t inp_end = sub_q.end;
+      double node_start, node_end;
+      memcpy(&node_start, &currentCoreStart, sizeof(node_start));
+      memcpy(&node_end, &currentCoreEnd, sizeof(node_end));
+
+      if (debug())
+        DPRINTF(WindowManager,
+                "Checking range inp_start:%d inp_end:%d against node_start:%f "
+                "node_end:%f\n",
+                inp_start, inp_end, node_start, node_end);
+
+      assert(node_start < node_end);
+
+      bool is_leaf = isLeafNode(currentCoreAddr);
+      bool case_skip = (node_start > inp_end) || (node_end < inp_start);
+      bool case_add_to_list = (inp_start <= node_start && node_end <= inp_end);
+
+      if (debug())
+        DPRINTF(WindowManager, "is leaf %d skip %d add %d\n", is_leaf,
+                case_skip, case_add_to_list);
+
+      if (case_skip) { // skip
+        state = requestCoreStart;
+      } else if (case_add_to_list) { // add to list
+        if (std::find(computationCores.begin(), computationCores.end(),
+                      currentCoreAddr) == computationCores.end()) {
+          if (debug())
+            DPRINTF(WindowManager, "added to CCs: 0x%016x %f-%f diff %d\n",
+                    currentCoreAddr, node_start, node_end,
+                    currentCoreEnd - currentCoreStart);
+          computationCores.push_back(currentCoreAddr);
+          owner->ccAddressToRange[currentCoreAddr] =
+              (TimeseriesRange){(uint64_t)node_start, (uint64_t)node_end};
+        }
+        state = requestCoreStart;
+      } else if (!is_leaf) { // non-leaf & children
+        if (debug())
+          DPRINTF(WindowManager, "children of 0x%016x %f-%f are needed\n",
+                  currentCoreAddr, node_start, node_end);
+
+        // doing some high-level analytics to reduce the number of children
+        double current_node_size = node_end - node_start + 1;
+        double child_size = current_node_size / numChildren;
+        for (size_t i = 0; i < numChildren; i++) {
+          double child_start = node_start + i * child_size;
+          double child_end = child_start + child_size - 1;
+          bool skip_child = (child_end < inp_start) || (child_start > inp_end);
+          if (skip_child) {
+            if (debug())
+              DPRINTF(WindowManager, "skipped child #%d %f-%f\n", i,
+                      child_start, child_end);
+            continue;
+          }
+
+          Addr child_pointer = currentCoreAddr + (i + 3) * owner->tsDataSize;
+          if (std::find(childrenPointers.begin(), childrenPointers.end(),
+                        child_pointer) == childrenPointers.end()) {
+            childrenPointers.push_back(child_pointer);
+          }
+        }
+        state = requestCoreStart;
+      } else { // leaf & partial
+        double partial_start = fmax(inp_start, node_start);
+        double partial_diff = fabs(partial_start - fmin(inp_end, node_end));
+
+        Addr partial_start_addr =
+            currentCoreAddr +
+            ((uint64_t)(partial_start - node_start)) * coreStatOffset;
+        uint64_t partial_length = (uint64_t)partial_diff + 1;
+
+        if (debug())
+          DPRINTF(WindowManager,
+                  "added to partials 0x%016x, %d while on %f-%f\n",
+                  partial_start_addr, partial_length, node_start, node_end);
+
+        partials.push(std::make_pair(partial_start_addr, partial_length));
+        state = requestCoreStart;
+      }
+    }
+
+    if (!coreQueue.empty())
+      coreQueue.pop();
+  } else if (state == requestChildAddr) {
+    if (debug())
+      DPRINTF(WindowManager, "State: requestChildAddr\n");
+
+    Addr child_pointer = childrenPointers.front();
+
+    if (debug())
+      DPRINTF(WindowManager, "Requesting address for pointer 0x%016x\n",
+              child_pointer);
+
+    if (GlobalPort *memory_port =
+            owner->getValidGlobalPort(child_pointer, true)) {
+      MemoryRequest *read_req =
+          owner->readFromPort(memory_port, child_pointer, owner->tsDataSize);
+      owner->activeTimeseriesWindowRequests[this].push_back(read_req);
+      state = waitingChildAddr;
+    } else {
+      if (debug())
+        DPRINTF(WindowManager,
+                "Did not find a global port to read %d bytes from 0x%016x\n",
+                owner->tsDataSize, child_pointer);
+    }
+  } else if (state == firstScanDone) {
+    state = initTraverse;
   }
 }
 

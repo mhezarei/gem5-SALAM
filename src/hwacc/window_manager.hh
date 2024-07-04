@@ -187,7 +187,8 @@ private:
 
   class TimeseriesWindow {
   private:
-    inline static const std::string cacheType = "normal";
+    inline static const std::string cacheType = "limited";
+    inline static const uint64_t limitedCacheMinDifference = 4095;
     inline static const size_t batchSize = 4;
     inline static const size_t numChildren = 4;
     inline static const Addr tsCoresStartAddr = 0x80c00000;
@@ -290,6 +291,7 @@ private:
       return traverseStack.empty() && computationCores.empty();
     }
     bool useCache() { return cacheType != ""; }
+    bool useLimitedCache() { return cacheType == "limited"; }
     bool useIdealCache() { return cacheType == "ideal"; }
     void checkCacheFunction();
     void saveCacheFunction(Addr cc_address, uint64_t cc_stat);
