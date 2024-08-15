@@ -139,24 +139,24 @@ def build_test_system(np):
     elif args.kernel is not None:
         test_sys.workload.object_file = binary(args.kernel)
 
-        bench_suffix = "F4B4"
-        cores_path = (
-            os.environ["M5_APP_PATH"]
-            + "/TEMPLATE"
-            + "/data/"
-            + f"cores_full_{bench_suffix}.bin"
-        )
-        values_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"values_1GB.bin"
-        cores_size = os.path.getsize(cores_path)
-        test_sys.workload.extras = [cores_path, values_path]
-        test_sys.workload.extras_addrs = [0x80C00000, 0x80C00000 + cores_size]
+        # bench_suffix = "F4B4"
+        # cores_path = (
+        #     os.environ["M5_APP_PATH"]
+        #     + "/TEMPLATE"
+        #     + "/data/"
+        #     + f"cores_full_{bench_suffix}.bin"
+        # )
+        # values_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"values_1GB.bin"
+        # cores_size = os.path.getsize(cores_path)
+        # test_sys.workload.extras = [cores_path, values_path]
+        # test_sys.workload.extras_addrs = [0x80C00000, 0x80C00000 + cores_size]
 
-        # load = "1000"  # 1000, full
-        # ii_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"ii_{load}.bin"
-        # abp_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/" + f"abp_{load}.bin"
-        # ii_size = os.path.getsize(ii_path)
-        # test_sys.workload.extras = [ii_path, abp_path]
-        # test_sys.workload.extras_addrs = [0x80C00000, 0x80C00000 + ii_size]
+        load = "1000"  # 1000, full
+        ii_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/data/" + f"ii_{load}.bin"
+        abp_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/data/" + f"abp_{load}.bin"
+        ii_size = os.path.getsize(ii_path)
+        test_sys.workload.extras = [ii_path, abp_path]
+        test_sys.workload.extras_addrs = [0x80C00000, 0x80C00000 + ii_size]
 
     if args.script is not None:
         test_sys.readfile = args.script
