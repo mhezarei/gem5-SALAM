@@ -755,14 +755,14 @@ class Variable:
                 + ")"
             )
             lines.append(
-                f"clstr.{self.inCon}.{'pe_resp_stream_ports' if self.inCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_in"
+                f"clstr.{self.inCon}.{'resp_stream_ports' if self.inCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_in"
             )
             if self.inCon != "wm":
                 lines.append(
                     f"clstr.{self.inCon}.stream = clstr.{self.name.lower()}.status_in"
                 )
             lines.append(
-                f"clstr.{self.outCon}.{'pe_req_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_out"
+                f"clstr.{self.outCon}.{'req_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_out"
             )
             if self.outCon != "wm":
                 lines.append(

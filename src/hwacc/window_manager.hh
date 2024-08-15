@@ -18,13 +18,21 @@ public:
 private:
   inline static const size_t peRequestLength = 8;
   inline static const size_t tsDataSize = 8;
-  inline static const size_t signalDataSize = 4;
-  inline static const uint64_t endToken = UINT64_MAX;
+  inline static const size_t signalDataSize = 8;
+  inline static const uint64_t endToken = 0xC24784AC985B0000;  // -202020303030
+  inline static const uint64_t stopToken = 0xC23784AD5DA40000; // -101010202020
   inline static const Addr spmAddr = 0x10021080;
   inline static const size_t spmSize = 64 * 1024;
-  inline static const std::string operatingMode = "timeseries";
+  inline static const std::string operatingMode = "signal";
   inline static const bool fakeValues = false;
 
+  // signal related
+  // TODO: clean up
+  inline static const int numInputSignalStreams = 2;
+  inline static const size_t numSignalTableEntries = 64;
+
+  // timeseries related
+  // TODO: clean up
   inline static const size_t numPerPERequests = 1024;
   inline static const size_t perRequestPEConcurrentTimeseriesWindows = 8;
   inline static const std::vector<Addr> calcAddresses = {
@@ -58,6 +66,8 @@ private:
   };
 
 private:
+  typedef uint64_t Offset, HashType;
+
   struct SignalPERequest {
     uint32_t sourceAddr;
     uint16_t startElement;
@@ -81,9 +91,22 @@ private:
     TimeseriesRange range;
     uint64_t stat;
   };
+  struct SignalRecord {
+    uint64_t timestamp = UINT64_MAX;
+    uint64_t value = UINT64_MAX;
+
+    bool isPartial() { return timestamp != UINT64_MAX && value == UINT64_MAX; }
+    bool isComplete() { return timestamp != UINT64_MAX && value != UINT64_MAX; }
+  };
+  struct SignalTableEntry {
+    HashType hashValue;
+    uint64_t outputValue;
+
+    bool valid() { return hashValue != 0 && outputValue != 0; }
+  };
   // TODO: clean this up please
   inline static const size_t cacheEntrySize = sizeof(CacheEntry);
-  typedef uint64_t Offset;
+  inline static const size_t signalTableEntrySize = sizeof(SignalTableEntry);
 
   class SPMPort : public ScratchpadRequestPort {
     friend class WindowManager;
@@ -299,33 +322,26 @@ private:
 
   class SignalWindow {
   private:
-    inline static const bool shouldUseCache = false;
-    inline static const int numCores = 6;
-    inline static const std::map<std::string, Addr> coreStreamAddr = {
-        {"0_3", 0}, {"1_2", 0}, {"2_4", 0}, {"3_5", 0}, {"4_5", 0}};
-    inline static const std::map<std::string, Addr> wmCoreStreamAddr = {
-        {"0", 0}, {"1", 0}, {"2", 0}, {"3", 0}, {"4_5", 0}, {"5", 0}};
-
   private:
     std::string windowName;
     WindowManager *owner;
-    Addr baseMemoryAddr;
-    std::queue<MemoryRequest *> memoryRequests;
-
-    Addr spmBaseAddr;
-    Offset currentSPMOffset;
     PEPort *correspondingPEPort;
 
+    bool done;
+    bool full;
+    std::vector<SignalRecord> entries;
+
   public:
-    SignalWindow(WindowManager *owner, Addr base_memory_addr,
-                 const std::vector<Offset> &offsets, Addr base_spm_addr,
-                 PEPort *pe_port);
+    SignalWindow(WindowManager *owner, PEPort *pe_port, size_t id);
     bool debug() { return owner->debug(); }
-    bool sendMemoryRequest();
-    bool sendSPMRequest(uint64_t data);
     std::string name() const { return windowName; }
     PEPort *getCorrespondingPEPort() { return correspondingPEPort; }
-    Addr getSPMBaseAddr() { return spmBaseAddr; }
+
+    bool isFull() { return full; }
+    void makeDone() { done = true; }
+    bool isDone() { return done; }
+    void handleNewSignalStreamInput(uint64_t data);
+    void sendEntriesForward();
   };
 
   TickEvent tickEvent;
@@ -347,14 +363,17 @@ private:
   std::vector<SPMPort *> spmPorts;
   std::vector<LocalPort *> localPorts;
   std::vector<GlobalPort *> globalPorts;
-  std::vector<PEPort *> peRequestStreamPorts;
-  std::vector<PEPort *> peResponseStreamPorts;
+  std::vector<PEPort *> requestStreamPorts;
+  std::vector<PEPort *> responseStreamPorts;
 
-  // Tkh, koosi sher
+  // Tkh, koosi sher for timeseries
   std::map<Addr, bool> calcStatus;
   std::queue<TimeseriesRange> requests;
   std::map<Addr, std::vector<TimeseriesRange>> perPERequests;
   std::map<Addr, TimeseriesRange> ccAddressToRange;
+
+  // Tkh, koosi sher for signal
+  size_t numCreatedSignalWindows;
 
   // Timeseries cache
   std::vector<CacheEntry> timeseriesCache;
@@ -372,13 +391,10 @@ private:
   std::vector<MemoryRequest *> activeWriteRequests;
 
   // signal data structures
-  std::queue<std::pair<SignalWindow *, uint64_t>> spmRetryRequests;
-  std::vector<bool> finishedPEs;
-  Addr signalCurrentFreeSPMAddr;
-  // TODO: change this to vector with the necessary changes
-  std::queue<SignalWindow *> activeSignalWindows;
-  std::map<SignalWindow *, std::vector<MemoryRequest *>>
-      activeSignalWindowRequests;
+  std::vector<SignalWindow *> activeSignalWindows;
+  std::vector<SignalTableEntry> signalTable;
+  std::vector<PEPort *> inputStreams;
+  std::map<PEPort *, bool> inputStreamsDone;
 
   // timeseries data structures
   std::vector<TimeseriesWindow *> activeTimeseriesWindows;
@@ -402,13 +418,25 @@ private:
   uint64_t extractPERequestValue(MemoryRequest *read_req);
 
   // Signal utility functions
-  void handleSignalPEResponse(MemoryRequest *read_req, PEPort *pe_port);
-  void handleSignalMemoryResponse(PacketPtr pkt, MemoryRequest *read_req);
-  void sendSPMAddrToPE(PEPort *pe_port, Addr spm_addr);
-  SignalPERequest constructSignalPERequest(MemoryRequest *read_req);
-  SignalWindow *findCorrespondingSignalWindow(PacketPtr pkt);
-  void removeSignalWindowRequest(MemoryRequest *mem_req);
+  void handleSignalStreamReadResponse(MemoryRequest *read_req, PEPort *pe_port);
   bool isSignalMode() { return operatingMode == "signal"; }
+  void signalMainLogic();
+  void removeDoneSignalWindows();
+  bool areStreamsDone() {
+    return !inputStreamsDone.empty() &&
+           std::all_of(inputStreamsDone.begin(), inputStreamsDone.end(),
+                       [](auto &w) { return w.second; });
+  }
+  PEPort *findCorrespondingStreamOutputPort(PEPort *pe_port);
+  bool signalWindowsReadyToHash() {
+    return !activeSignalWindows.empty() &&
+           std::all_of(activeSignalWindows.begin(), activeSignalWindows.end(),
+                       [](auto &w) { return w->isFull(); });
+  }
+  HashType computeHash();
+  SignalTableEntry accessSignalTable(HashType hash_value);
+  void signalTableHitHandler(SignalTableEntry ste);
+  void signalTableMissHandler(HashType hash_value);
 
   // Timeseries utility functions
   void handleTimeseriesMemoryResponse(PacketPtr pkt, MemoryRequest *req);

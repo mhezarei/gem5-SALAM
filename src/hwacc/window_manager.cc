@@ -16,10 +16,10 @@ WindowManager::WindowManager(const WindowManagerParams &p)
       io_addr(p.pio_addr), endian(p.system->getGuestByteOrder()) {
   processingDelay = 1000 * clockPeriod;
 
-  signalCurrentFreeSPMAddr = spmAddr;
-
   mmr = new uint8_t[io_size];
   std::fill(mmr, mmr + io_size, 0);
+
+  numCreatedSignalWindows = 0;
 
   numCacheAccesses = 0;
   numCacheHits = 0;
@@ -47,15 +47,7 @@ void WindowManager::recvPacket(PacketPtr pkt) {
 
     if (PEPort *pe_port = dynamic_cast<PEPort *>(carrier_port)) {
       if (isSignalMode()) {
-        if (*((uint64_t *)read_req->getBuffer()) == endToken) {
-          finishedPEs.push_back(true);
-          removeRequest(read_req, activeReadRequests);
-          scheduleEvent();
-          delete pkt;
-          return;
-        }
-
-        handleSignalPEResponse(read_req, pe_port);
+        handleSignalStreamReadResponse(read_req, pe_port);
       } else if (isTimeseriesMode()) {
         handleTimeseriesPEResponse(read_req, pe_port);
       }
@@ -63,7 +55,7 @@ void WindowManager::recvPacket(PacketPtr pkt) {
                    dynamic_cast<GlobalPort *>(carrier_port)) {
       global_port->waitingResponsePkt = nullptr;
       if (isSignalMode()) {
-        handleSignalMemoryResponse(pkt, read_req);
+        // handleSignalMemoryResponse(pkt, read_req);
       } else if (isTimeseriesMode()) {
         handleTimeseriesMemoryResponse(pkt, read_req);
       }
@@ -85,7 +77,7 @@ void WindowManager::recvPacket(PacketPtr pkt) {
               pkt->req->getPaddr(), pkt->getSize());
 
     if (SPMPort *port = dynamic_cast<SPMPort *>(carrier_port)) {
-      removeSignalWindowRequest(write_req);
+      // removeSignalWindowRequest(write_req);
     } else if (PEPort *port = dynamic_cast<PEPort *>(carrier_port)) {
     } else if (GlobalPort *port = dynamic_cast<GlobalPort *>(carrier_port)) {
       port->waitingResponsePkt = nullptr;
@@ -104,6 +96,12 @@ void WindowManager::recvPacket(PacketPtr pkt) {
   scheduleEvent();
   delete pkt;
 }
+
+/* ************************************************************************** */
+/* ************************************************************************** */
+/* ************************************************************************** */
+/* ************************************************************************** */
+/* ************************************************************************** */
 
 /* Timeseries-related functions */
 WindowManager::TimeseriesWindow::TimeseriesWindow(WindowManager *owner,
@@ -766,12 +764,12 @@ void WindowManager::TimeseriesWindow::traverseTick() {
   } else if (state == computeStat_RequestResult) {
     // finding the matching request port
     assert(connectedCalcPort != nullptr);
-    int port_idx = std::distance(owner->peResponseStreamPorts.begin(),
-                                 std::find(owner->peResponseStreamPorts.begin(),
-                                           owner->peResponseStreamPorts.end(),
+    int port_idx = std::distance(owner->responseStreamPorts.begin(),
+                                 std::find(owner->responseStreamPorts.begin(),
+                                           owner->responseStreamPorts.end(),
                                            connectedCalcPort));
-    assert(port_idx < owner->peRequestStreamPorts.size());
-    PEPort *calc_req_port = owner->peRequestStreamPorts[port_idx];
+    assert(port_idx < owner->requestStreamPorts.size());
+    PEPort *calc_req_port = owner->requestStreamPorts[port_idx];
     assert(calc_req_port != nullptr);
 
     if (owner->checkPort(calc_req_port, owner->peRequestLength, true)) {
@@ -842,7 +840,7 @@ void WindowManager::timeseriesTick() {
   if (activeTimeseriesWindows.empty()) {
     for (auto &pair : perPERequests) {
       PEPort *corrensponding_pe_port = nullptr;
-      for (auto &req_pe_port : peRequestStreamPorts) {
+      for (auto &req_pe_port : requestStreamPorts) {
         if (req_pe_port->getStartAddr() == pair.first) {
           corrensponding_pe_port = req_pe_port;
         }
@@ -904,7 +902,7 @@ void WindowManager::timeseriesTick() {
   }
 
   // read from PEs (start, end)
-  // for (PEPort *port : peRequestStreamPorts) {
+  // for (PEPort *port : requestStreamPorts) {
   //   if (std::find(reqPEAddresses.begin(), reqPEAddresses.end(),
   //                 port->getStartAddr()) != reqPEAddresses.end() &&
   //       checkPort(port, peRequestLength, true)) {
@@ -1151,7 +1149,7 @@ bool WindowManager::TimeseriesWindow::isLeafNode(Addr node_addr) {
 
 WindowManager::PEPort *WindowManager::TimeseriesWindow::findFreeCalcUnitPort() {
   Addr free_calc_unit_addr = owner->getFreeCalcUnitAddr();
-  for (auto &port : owner->peResponseStreamPorts) {
+  for (auto &port : owner->responseStreamPorts) {
     if (port->getStartAddr() == free_calc_unit_addr) {
       if (debug())
         DPRINTF(WindowManager, "found a free calc unit with addr 0x%016x\n",
@@ -1200,172 +1198,213 @@ void WindowManager::TimeseriesWindow::setTimeseriesPERequest(uint64_t value) {
 /* Signal-related functions */
 void WindowManager::signalTick() {
   // turning off condition
-  if (activeSignalWindowRequests.empty() &&
-      finishedPEs.size() == peRequestStreamPorts.size()) {
+  if (areStreamsDone()) {
     *mmr &= 0xfc;
     *mmr |= 0x04;
     return;
   }
 
-  // Check all the pe ports for incoming requests
-  for (PEPort *port : peRequestStreamPorts) {
+  signalMainLogic();
+
+  removeDoneSignalWindows();
+
+  // check all the pe ports for incoming requests
+  if (inputStreams.empty()) {
+    inputStreams = std::vector<PEPort *>(requestStreamPorts.begin(),
+                                         requestStreamPorts.begin() + 2);
+    for (auto is : inputStreams)
+      inputStreamsDone[is] = false;
+  }
+
+  for (PEPort *port : inputStreams) {
     if (checkPort(port, peRequestLength, true)) {
       readFromPort(port, port->getStartAddr(), peRequestLength);
     }
   }
+}
 
-  // remove windows without any requests
-  for (auto it = activeSignalWindowRequests.begin();
-       it != activeSignalWindowRequests.end(); it++)
-    if (it->second.empty()) {
-      // respond to the corresponding PE
-      SignalWindow *window = it->first;
-      sendSPMAddrToPE(window->getCorrespondingPEPort(),
-                      window->getSPMBaseAddr());
-      activeSignalWindowRequests.erase(it);
+void WindowManager::removeDoneSignalWindows() {
+  for (auto it = activeSignalWindows.begin();
+       it != activeSignalWindows.end();) {
+    if ((*it)->isDone()) {
+      if (debug())
+        DPRINTF(WindowManager, "erased one done window %s\n", (*it)->name());
+      it = activeSignalWindows.erase(it);
+    } else {
+      it++;
     }
-
-  // check the single ongoing SignalWindow (head of the queue)
-  if (activeSignalWindows.size()) {
-    if (debug())
-      DPRINTF(WindowManager, "Going over the head window...\n");
-    if (!activeSignalWindows.front()->sendMemoryRequest()) {
-      activeSignalWindows.pop();
-    }
-  }
-
-  // check all spmRetryRequests and send them to the SPM
-  while (!spmRetryRequests.empty()) {
-    SignalWindow *window = spmRetryRequests.front().first;
-    uint64_t data = spmRetryRequests.front().second;
-    if (window->sendSPMRequest(data))
-      spmRetryRequests.pop();
   }
 }
 
-void WindowManager::handleSignalMemoryResponse(PacketPtr pkt,
-                                               MemoryRequest *read_req) {
-  SignalWindow *window = findCorrespondingSignalWindow(pkt);
+void WindowManager::signalMainLogic() {
+  bool ready = signalWindowsReadyToHash();
+
+  if (ready) {
+    if (debug())
+      DPRINTF(WindowManager, "can finally move forward!\n");
+
+    auto hash_value = computeHash();
+
+    auto ste = accessSignalTable(hash_value);
+    if (ste.valid())
+      signalTableHitHandler(ste);
+    else
+      signalTableMissHandler(hash_value);
+
+    for (auto signal_window : activeSignalWindows) {
+      if (debug())
+        DPRINTF(WindowManager, "I AM DONE\n");
+      signal_window->makeDone();
+    }
+  }
+}
+
+WindowManager::HashType WindowManager::computeHash() {
+  // algo num 1: random number between [1, 10]
+  HashType hash_value = 1 + rand() % (100 - 1 + 1);
+
+  if (debug())
+    DPRINTF(WindowManager, "the hash value is %d\n", hash_value);
+
+  return hash_value;
+}
+
+WindowManager::SignalTableEntry
+WindowManager::accessSignalTable(HashType hash_value) {
+  auto it = find_if(begin(signalTable), end(signalTable),
+                    [hash_value](SignalTableEntry const &ste) {
+                      return ste.hashValue == hash_value;
+                    });
+
+  if (it != end(signalTable))
+    return *it;
+
+  return (SignalTableEntry){0, 0};
+}
+
+void WindowManager::signalTableHitHandler(SignalTableEntry ste) {
+  // TODO: send the skipped output
+
+  if (debug())
+    DPRINTF(WindowManager, "table hit; STE: 0x%016x 0x%016x\n", ste.hashValue,
+            ste.outputValue);
+}
+
+void WindowManager::signalTableMissHandler(HashType hash_value) {
+  // TODO: send the window via output stream
+  // TODO: automate output stream address and port
+
+  if (signalTable.size() < numSignalTableEntries) {
+    signalTable.push_back((SignalTableEntry){hash_value, 2019595501});
+
+    if (debug())
+      DPRINTF(WindowManager, "table has space; adding 0x%016x 0x%016x\n",
+              hash_value, 2019595501);
+  }
+
+  if (debug())
+    DPRINTF(WindowManager, "sending all windows\n");
+
+  for (auto w : activeSignalWindows) {
+    if (w->isFull()) {
+      w->sendEntriesForward();
+    }
+  }
+}
+
+void WindowManager::SignalWindow::sendEntriesForward() {
+  PEPort *output_port =
+      owner->findCorrespondingStreamOutputPort(getCorrespondingPEPort());
+
+  if (debug())
+    DPRINTF(WindowManager, "sending all entries to output stream xd\n");
+
+  for (auto e : entries) {
+    owner->writeToPort(output_port, e.timestamp, output_port->getStartAddr());
+    owner->writeToPort(output_port, e.value, output_port->getStartAddr());
+  }
+}
+
+WindowManager::PEPort *
+WindowManager::findCorrespondingStreamOutputPort(PEPort *pe_port) {
+  PEPort *output_port =
+      pe_port == requestStreamPorts[0]
+          ? responseStreamPorts[0]
+          : (pe_port == requestStreamPorts[1] ? responseStreamPorts[1]
+                                              : nullptr);
+  assert(output_port != nullptr);
+
+  return output_port;
+}
+
+void WindowManager::SignalWindow::handleNewSignalStreamInput(uint64_t data) {
+  if (data == stopToken) {
+    if (debug())
+      DPRINTF(WindowManager, "stop token; marking this window full\n");
+
+    full = true;
+    return;
+  }
+
+  if (entries.empty() || entries.back().isComplete()) {
+    if (debug())
+      DPRINTF(WindowManager, "new record\n");
+
+    entries.push_back((SignalRecord){data, UINT64_MAX});
+  } else if (entries.back().isPartial()) {
+    if (debug())
+      DPRINTF(WindowManager, "completing\n");
+
+    entries.back().value = data;
+  }
+}
+
+void WindowManager::handleSignalStreamReadResponse(MemoryRequest *read_req,
+                                                   PEPort *pe_port) {
   uint64_t data = *((uint64_t *)read_req->getBuffer());
 
-  if (!window->sendSPMRequest(data)) {
-    spmRetryRequests.push(std::make_pair(window, data));
-  }
+  if (debug())
+    DPRINTF(WindowManager, "received new stream input 0x%016x : 0x%016x\n",
+            pe_port->getStartAddr(), data);
 
-  removeSignalWindowRequest(read_req);
-}
-
-void WindowManager::sendSPMAddrToPE(PEPort *req_pe_port, Addr spm_addr) {
-  int port_idx =
-      std::distance(peRequestStreamPorts.begin(),
-                    std::find(peRequestStreamPorts.begin(),
-                              peRequestStreamPorts.end(), req_pe_port));
-  assert(port_idx < peResponseStreamPorts.size());
-
-  PEPort *pe_resp_port = peResponseStreamPorts[port_idx];
-  Addr destination_addr = pe_resp_port->getStartAddr();
-
-  writeToPort(pe_resp_port, spm_addr, destination_addr);
-}
-
-WindowManager::SignalPERequest
-WindowManager::constructSignalPERequest(MemoryRequest *read_req) {
-  uint64_t result = extractPERequestValue(read_req);
-
-  uint32_t source_addr = result >> 32;
-  uint16_t start_element = (result >> 16) & 0x000000000000FFFF;
-  uint16_t length = result & 0x000000000000FFFF;
-
-  return (SignalPERequest){source_addr, start_element, length};
-}
-
-WindowManager::SignalWindow::SignalWindow(WindowManager *owner,
-                                          Addr base_memory_addr,
-                                          const std::vector<Offset> &offsets,
-                                          Addr base_spm_addr, PEPort *pe_port)
-    : windowName("SignalWindow"), owner(owner),
-      baseMemoryAddr(base_memory_addr), spmBaseAddr(base_spm_addr),
-      currentSPMOffset(0), correspondingPEPort(pe_port) {
-  for (Offset o : offsets) {
-    Addr req_addr = baseMemoryAddr + o;
-
-    MemoryRequest *read_req =
-        new MemoryRequest(req_addr, owner->signalDataSize);
-    Request::Flags flags;
-    RequestPtr req = std::make_shared<Request>(req_addr, owner->signalDataSize,
-                                               flags, owner->masterId);
-    PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
-    read_req->setPacket(pkt);
-    pkt->allocate();
-    memoryRequests.push(read_req);
-  }
-}
-
-bool WindowManager::SignalWindow::sendMemoryRequest() {
-  if (memoryRequests.empty()) {
+  // case 0: end token
+  if (data == endToken) {
     if (debug())
-      DPRINTF(WindowManager, "No more memory read requests to send\n");
-    return false;
+      DPRINTF(WindowManager, "received end token\n");
+
+    PEPort *output_port = findCorrespondingStreamOutputPort(pe_port);
+    writeToPort(output_port, endToken, output_port->getStartAddr());
+
+    inputStreamsDone[pe_port] = true;
+    return;
   }
 
-  MemoryRequest *read_req = memoryRequests.front();
+  // case 1: another value for existing window
+  for (auto &signal_window : activeSignalWindows) {
+    if (signal_window->getCorrespondingPEPort() == pe_port) {
+      if (debug())
+        DPRINTF(WindowManager, "window already exists; appending\n");
 
-  if (GlobalPort *memory_port = dynamic_cast<GlobalPort *>(
-          owner->getValidGlobalPort(read_req->getAddress(), true))) {
-    if (debug())
-      DPRINTF(WindowManager,
-              "Trying to request addr: 0x%016x, %d bytes through port: %s\n",
-              read_req->getAddress(), read_req->getLength(),
-              memory_port->name());
-
-    read_req->setCarrierPort(memory_port);
-    memory_port->sendPacket(read_req->getPacket());
-
-    owner->activeReadRequests.push_back(read_req);
-    owner->activeSignalWindowRequests[this].push_back(read_req);
-    memoryRequests.pop();
-  } else {
-    if (debug())
-      DPRINTF(WindowManager,
-              "Did not find a global port to read %d bytes from 0x%016x\n",
-              read_req->getLength(), read_req->getAddress());
+      signal_window->handleNewSignalStreamInput(data);
+      return;
+    }
   }
 
-  return true;
+  // case 2: a new window
+  if (debug())
+    DPRINTF(WindowManager, "new window creation\n");
+
+  SignalWindow *signal_window =
+      new SignalWindow(this, pe_port, numCreatedSignalWindows);
+  activeSignalWindows.push_back(signal_window);
+  signal_window->handleNewSignalStreamInput(data);
+  numCreatedSignalWindows++;
 }
 
-bool WindowManager::SignalWindow::sendSPMRequest(uint64_t data) {
-  // create the SPM write packet and send it!
-  Addr addr = spmBaseAddr + currentSPMOffset;
-  SPMPort *spm_port = owner->getValidSPMPort(addr, false);
-
-  if (!spm_port)
-    return false;
-
-  MemoryRequest *write_req = owner->writeToPort(spm_port, data, addr);
-  owner->activeSignalWindowRequests[this].push_back(write_req);
-
-  currentSPMOffset += owner->signalDataSize;
-  return true;
-}
-
-void WindowManager::handleSignalPEResponse(MemoryRequest *read_req,
-                                           PEPort *pe_port) {
-  // window creation
-  SignalPERequest pe_req = constructSignalPERequest(read_req);
-  Addr base_addr = pe_req.sourceAddr;
-  std::vector<Offset> offsets;
-  for (uint16_t idx = pe_req.startElement;
-       idx < pe_req.startElement + pe_req.length; idx++)
-    offsets.push_back(idx * signalDataSize);
-
-  SignalWindow *window = new SignalWindow(this, base_addr, offsets,
-                                          signalCurrentFreeSPMAddr, pe_port);
-  activeSignalWindows.push(window);
-
-  // Move the SPM poninter based on PE request
-  signalCurrentFreeSPMAddr += pe_req.length * signalDataSize;
-}
+WindowManager::SignalWindow::SignalWindow(WindowManager *owner, PEPort *pe_port,
+                                          size_t id)
+    : windowName("SignalWindow_" + std::to_string(id)), owner(owner),
+      correspondingPEPort(pe_port), done(false), full(false) {}
 /* Signal-related functions */
 
 void WindowManager::tick() {
@@ -1603,8 +1642,8 @@ std::string WindowManager::PEPort::getPENameFromPeerPort() {
 }
 
 bool WindowManager::checkPort(RequestPort *port, size_t len, bool is_read) {
-  if (PEPort *pePort = dynamic_cast<PEPort *>(port))
-    return pePort->streamValid(len, is_read);
+  if (PEPort *pe_port = dynamic_cast<PEPort *>(port))
+    return pe_port->streamValid(len, is_read);
   else
     panic("currently no support for validation check other than PE port\n");
 
@@ -1636,19 +1675,19 @@ void WindowManager::printPortRanges() {
                 address.start(), address.end());
     }
   }
-  for (auto port : peRequestStreamPorts) {
+  for (auto port : requestStreamPorts) {
     AddrRangeList adl = port->getAddrRanges();
     for (auto address : adl) {
       if (debug())
-        DPRINTF(WindowManager, "peRequestStreamPorts: %s, Range: %lx-%lx\n",
+        DPRINTF(WindowManager, "requestStreamPorts: %s, Range: %lx-%lx\n",
                 port->name(), address.start(), address.end());
     }
   }
-  for (auto port : peResponseStreamPorts) {
+  for (auto port : responseStreamPorts) {
     AddrRangeList adl = port->getAddrRanges();
     for (auto address : adl) {
       if (debug())
-        DPRINTF(WindowManager, "peResponseStreamPorts: %s, Range: %lx-%lx\n",
+        DPRINTF(WindowManager, "responseStreamPorts: %s, Range: %lx-%lx\n",
                 port->name(), address.start(), address.end());
     }
   }
@@ -1679,24 +1718,24 @@ Port &WindowManager::getPort(const std::string &if_name, PortID idx) {
       spmPorts[idx] = new SPMPort(portName, this, idx);
     }
     return *spmPorts[idx];
-  } else if (if_name == "pe_req_stream_ports") {
-    if (idx >= peRequestStreamPorts.size())
-      peRequestStreamPorts.resize((idx + 1));
-    if (peRequestStreamPorts[idx] == nullptr) {
+  } else if (if_name == "req_stream_ports") {
+    if (idx >= requestStreamPorts.size())
+      requestStreamPorts.resize((idx + 1));
+    if (requestStreamPorts[idx] == nullptr) {
       const std::string portName =
-          name() + csprintf(".pe_req_stream_ports[%d]", idx);
-      peRequestStreamPorts[idx] = new PEPort(portName, this, idx);
+          name() + csprintf(".req_stream_ports[%d]", idx);
+      requestStreamPorts[idx] = new PEPort(portName, this, idx);
     }
-    return *peRequestStreamPorts[idx];
-  } else if (if_name == "pe_resp_stream_ports") {
-    if (idx >= peResponseStreamPorts.size())
-      peResponseStreamPorts.resize((idx + 1));
-    if (peResponseStreamPorts[idx] == nullptr) {
+    return *requestStreamPorts[idx];
+  } else if (if_name == "resp_stream_ports") {
+    if (idx >= responseStreamPorts.size())
+      responseStreamPorts.resize((idx + 1));
+    if (responseStreamPorts[idx] == nullptr) {
       const std::string portName =
-          name() + csprintf(".pe_resp_stream_ports[%d]", idx);
-      peResponseStreamPorts[idx] = new PEPort(portName, this, idx);
+          name() + csprintf(".resp_stream_ports[%d]", idx);
+      responseStreamPorts[idx] = new PEPort(portName, this, idx);
     }
-    return *peResponseStreamPorts[idx];
+    return *responseStreamPorts[idx];
   } else {
     return BasicPioDevice::getPort(if_name, idx);
   }
@@ -1745,38 +1784,6 @@ void WindowManager::removeRequest(MemoryRequest *mem_req,
   //   DPRINTF(WindowManager,
   //           "Could not find memory request in request queues (for
   //           removal)\n");
-}
-
-WindowManager::SignalWindow *
-WindowManager::findCorrespondingSignalWindow(PacketPtr pkt) {
-  for (const auto &elem : activeSignalWindowRequests)
-    for (const auto &req : elem.second)
-      if (req->getPacket() == pkt)
-        return elem.first;
-
-  panic("Could not find memory request in active window requests map\n");
-  return nullptr;
-}
-
-void WindowManager::removeSignalWindowRequest(MemoryRequest *mem_req) {
-  if (debug())
-    DPRINTF(WindowManager, "Clearing Request with addr 0x%016x\n",
-            mem_req->getAddress());
-
-  for (const auto &elem : activeSignalWindowRequests) {
-    for (auto it = elem.second.begin(); it != elem.second.end(); ++it) {
-      if (*it == mem_req) {
-        activeSignalWindowRequests[elem.first].erase(it);
-        return;
-      }
-    }
-  }
-
-  // TODO: is it ok if the request is not present?
-  if (debug())
-    DPRINTF(WindowManager,
-            "Did not find the memory request with 0x%016x to remove!\n",
-            mem_req->getAddress());
 }
 
 WindowManager::TimeseriesWindow *
