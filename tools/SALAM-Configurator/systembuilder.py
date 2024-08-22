@@ -113,6 +113,7 @@ def parse_yaml(
         dmas = []
         accs = []
         window_managers = []
+        state_stores = []
         for device in cluster_dict["acc_cluster"]:
             if "Name" in device:
                 cluster_name = device["Name"]
@@ -122,6 +123,8 @@ def parse_yaml(
                 accs.append(device)
             if "WindowManager" in device:
                 window_managers.append(device)
+            if "StateStore" in device:
+                state_stores.append(device)
 
         if not cluster_name:
             continue
@@ -132,6 +135,7 @@ def parse_yaml(
                 dmas=dmas,
                 accs=accs,
                 window_managers=window_managers,
+                state_stores=state_stores,
                 base_address=base_address,
                 working_dir=working_dir,
                 config_path=parent_path,
@@ -172,11 +176,15 @@ def gen_config(clusters, config_path: str, file_name: str):
                 writeLines(writer, acc.genDefinition())
             for wm in cluster.window_managers:
                 writeLines(writer, wm.genDefinition())
+            for ss in cluster.state_stores:
+                writeLines(writer, ss.genDefinition())
 
             for acc in cluster.accs:
                 writeLines(writer, acc.genConfig())
             for wm in cluster.window_managers:
                 writeLines(writer, wm.genConfig())
+            for ss in cluster.state_stores:
+                writeLines(writer, ss.genConfig())
 
         # Write cluster creation
         writer.write("def makeHWAcc(args, system):\n\n")
@@ -363,6 +371,28 @@ def gen_header(header_list, clusters, working_dir: str):
                         "#define " + wm.name.upper() + " " + hex(wm.pio_addr) + "\n"
                     )
                     for var in wm.variables:
+                        if "Stream" in var.type:
+                            current_header.append(
+                                "#define " + var.name + " " + hex(var.address) + "\n"
+                            )
+                            current_header.append(
+                                "#define "
+                                + var.name
+                                + "_Status "
+                                + hex(var.statusAddress)
+                                + "\n"
+                            )
+                        else:
+                            current_header.append(
+                                "#define " + var.name + " " + hex(var.address) + "\n"
+                            )
+
+                for ss in cluster.state_stores:
+                    current_header.append("//StateStore: " + ss.name.upper() + "\n")
+                    current_header.append(
+                        "#define " + ss.name.upper() + " " + hex(ss.pio_addr) + "\n"
+                    )
+                    for var in ss.variables:
                         if "Stream" in var.type:
                             current_header.append(
                                 "#define " + var.name + " " + hex(var.address) + "\n"

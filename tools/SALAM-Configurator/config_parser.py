@@ -5,6 +5,7 @@ class AccCluster:
         dmas,
         accs,
         window_managers,
+        state_stores,
         base_address: int,
         working_dir: str,
         config_path: str,
@@ -14,6 +15,7 @@ class AccCluster:
         self.dmas = dmas
         self.accs = accs
         self.window_managers = window_managers
+        self.state_stores = state_stores
         self.base_address = base_address
         self.top_address = base_address
         self.config_path = config_path
@@ -26,6 +28,7 @@ class AccCluster:
         dma_class = []
         acc_class = []
         window_manager_class = []
+        state_store_class = []
         top_address = self.base_address
 
         # Parse DMAs
@@ -212,6 +215,80 @@ class AccCluster:
                 )
             )
 
+        # Parse State Stores
+        for ss in self.state_stores:
+            name = None
+            pio_addr = None
+            pio_size = None
+            master = None
+            debug = False
+            num_mem_ports = None
+            variables = []
+
+            # Find the name first...
+            # Also, find a non-stupid way to find the name first
+            for device_dict in ss["StateStore"]:
+                if "Name" in device_dict:
+                    name = device_dict["Name"]
+            # Parse the rest of the parameters
+            for device_dict in ss["StateStore"]:
+                if "PIOSize" in device_dict:
+                    pio_addr = top_address
+                    size = device_dict["PIOSize"]
+                    pio_size = size + (64 - (size % 64))
+                    top_address += pio_size
+                if "PIOMaster" in device_dict:
+                    master = device_dict["PIOMaster"]
+                if "Debug" in device_dict:
+                    debug = device_dict["Debug"]
+                if "MemoryPorts" in device_dict:
+                    num_mem_ports = device_dict["MemoryPorts"]
+                if "Var" in device_dict:
+                    for var in device_dict["Var"]:
+                        # Setup the variable's parameters to pass
+                        varParams = dict(var)
+                        varParams["Address"] = top_address
+                        varParams["AccName"] = name
+
+                        if varParams["Type"] == "Stream":
+                            aligned_inc = int(var["StreamSize"] + 4) + (
+                                64 - (int(var["StreamSize"] + 4) % 64)
+                            )
+                            statusAddress = top_address + aligned_inc
+                            varParams["StatusAddress"] = statusAddress
+
+                        # Create and append a new variable
+                        variables.append(Variable(**varParams))
+                        # Increment the current address based on size
+                        if "SPM" in var["Type"]:
+                            aligned_inc = int(var["Size"]) + (
+                                64 - (int(var["Size"]) % 64)
+                            )
+                            top_address += aligned_inc
+                        elif "Stream" in var["Type"]:
+                            statusSize = 4
+                            aligned_inc = int(var["StreamSize"] + 4) + (
+                                64 - (int(var["StreamSize"] + 4) % 64)
+                            )
+                            status_inc = int(statusSize) + (64 - (int(statusSize) % 64))
+                            top_address += aligned_inc + status_inc
+                        else:
+                            # Should never get here... but just in case throw an exception
+                            exceptionString = f"The Variable: {name} has an invalid type named: {var['Type']}"
+                            raise Exception(exceptionString)
+            # Append accelerator to the cluster
+            state_store_class.append(
+                StateStore(
+                    name=name,
+                    pio_addr=pio_addr,
+                    pio_size=pio_size,
+                    master=master,
+                    variables=variables,
+                    debug=debug,
+                    num_mem_ports=num_mem_ports,
+                )
+            )
+
         # Parse Accelerators
         for acc in self.accs:
             name = None
@@ -327,6 +404,7 @@ class AccCluster:
         self.accs = acc_class
         self.dmas = dma_class
         self.window_managers = window_manager_class
+        self.state_stores = state_store_class
         self.top_address = top_address
 
     def genConfig(self):
@@ -370,6 +448,53 @@ class WindowManager:
         lines.append("wm_name = " + '"' + self.name + '"')
         lines.append(
             f"clstr.{self.name} = WindowManager(devicename=wm_name, pio_addr={str(hex(self.pio_addr))}, pio_size={self.pio_size}, clock_period=1, )"
+        )
+        lines.append("")
+        return lines
+
+    def genConfig(self):
+        lines = []
+
+        lines.append("# " + self.name + " Config")
+        lines.append(f"clstr.{self.name}.local = clstr.local_bus.cpu_side_ports")
+        for _ in range(4 * self.num_mem_ports):
+            lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
+        lines.append(f"clstr.{self.name}.pio = clstr.local_bus.mem_side_ports")
+        lines.append(f"clstr.{self.name}.debug_enabled = {str(self.debug)}")
+        lines.append("")
+
+        for master in self.master:
+            if "LocalBus" in master:
+                lines.append(
+                    "clstr." + self.name + ".pio = clstr.local_bus.mem_side_ports"
+                )
+
+        for var in self.variables:
+            # Have the variable create its config
+            lines = var.genConfig(lines)
+            lines.append("")
+
+        return lines
+
+
+class StateStore:
+    def __init__(
+        self, name, pio_addr, pio_size, master, variables, debug, num_mem_ports
+    ):
+        self.name = name.lower()
+        self.pio_addr = pio_addr
+        self.pio_size = pio_size
+        self.master = master
+        self.variables = variables
+        self.debug = debug
+        self.num_mem_ports = num_mem_ports
+
+    def genDefinition(self):
+        lines = []
+        lines.append("# " + self.name + " Definition")
+        lines.append("ss_name = " + '"' + self.name + '"')
+        lines.append(
+            f"clstr.{self.name} = StateStore(devicename=ss_name, pio_addr={str(hex(self.pio_addr))}, pio_size={self.pio_size}, clock_period=1, )"
         )
         lines.append("")
         return lines
@@ -500,8 +625,8 @@ class Accelerator:
                 # lines.append("clstr." + self.name + ".pio " +
                 #              "=" " clstr." + i + ".local")
         # Assign ACP
-        for _ in range(64):
-            lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
+        # for _ in range(64):
+        lines.append(f"clstr.{self.name}.acp = clstr.coherency_bus.cpu_side_ports")
         # Add StreamIn
         for inCon in self.stream_in:
             lines.append(
@@ -754,20 +879,22 @@ class Variable:
                 + str(self.bufferSize)
                 + ")"
             )
+
             lines.append(
-                f"clstr.{self.inCon}.{'resp_stream_ports' if self.inCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_in"
+                f"clstr.{self.inCon}.{'resp_stream_ports' if self.inCon == 'wm' or self.inCon == 'ss' else 'stream'} = clstr.{self.name.lower()}.stream_in"
             )
-            if self.inCon != "wm":
+            if self.inCon != "wm" and self.inCon != "ss":
                 lines.append(
                     f"clstr.{self.inCon}.stream = clstr.{self.name.lower()}.status_in"
                 )
             lines.append(
-                f"clstr.{self.outCon}.{'req_stream_ports' if self.outCon == 'wm' else 'stream'} = clstr.{self.name.lower()}.stream_out"
+                f"clstr.{self.outCon}.{'req_stream_ports' if self.outCon == 'wm' or self.outCon == 'ss' else 'stream'} = clstr.{self.name.lower()}.stream_out"
             )
-            if self.outCon != "wm":
+            if self.outCon != "wm" and self.outCon != "ss":
                 lines.append(
                     f"clstr.{self.outCon}.stream = clstr.{self.name.lower()}.status_out"
                 )
+
             lines.append("")
         # Scratchpad Memory
         elif self.type == "SPM":

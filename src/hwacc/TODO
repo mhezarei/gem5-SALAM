@@ -13,3 +13,7 @@ Timeseries:
 Signal Processing:
     ☐ Comparing different approaches
     ☐ Change `activeSignalWindows` to a vector with the necessary modifications
+
+State Store:
+    ☐ Create the class for joining
+    ☐ Inside TODOs

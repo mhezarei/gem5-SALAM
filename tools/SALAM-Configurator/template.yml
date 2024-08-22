@@ -31,15 +31,13 @@ acc_cluster:
       PIOSize: # PIO Size
       PIOMaster: # PIO Master list (Required)
       Debug: # True or False; prints window manager debug messages (Optional)
-    # Scratchpad Memory Example
-    - Var:
-      - Name: # Var name here (Required)
-        Type: # SPM
-        Size: # Size in Bytes (Required)
-        Ports: # Number of ports to connect to parent Acc
-        ResetOnRead: # True/False | Reset ready bit on private scratchpad memory read
-        ReadOnInvalid: # True/False | Enable reads on invalid memory segments when ready mode is used
-        WriteOnValid: # True/False | Enable writes on valid memory sectors when ready mode is used
+  
+  # State Store Example
+  - StateStore:
+    - Name: # StateStore name here(Required)
+      PIOSize: # PIO Size
+      PIOMaster: # PIO Master list (Required)
+      Debug: # True or False; prints state store debug messages (Optional)
 
   # Accelerator Example
   - Accelerator:
