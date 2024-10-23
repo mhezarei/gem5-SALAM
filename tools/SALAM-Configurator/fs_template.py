@@ -158,11 +158,15 @@ def build_test_system(np):
         # test_sys.workload.extras = [ii_path, abp_path]
         # test_sys.workload.extras_addrs = [0x80C00000, 0x80C00000 + ii_size]
 
-        a_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/data/" + f"a.bin"
-        b_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/data/" + f"b.bin"
-        a_size = os.path.getsize(a_path)
-        test_sys.workload.extras = [a_path, b_path]
-        test_sys.workload.extras_addrs = [0x80C00000, 0x80C00000 + a_size]
+        # a_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/data/" + f"a.bin"
+        # b_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/data/" + f"b.bin"
+        # a_size = os.path.getsize(a_path)
+        # test_sys.workload.extras = [a_path, b_path]
+        # test_sys.workload.extras_addrs = [0x80C00000, 0x80C00000 + a_size]
+
+        vals_path = os.environ["M5_APP_PATH"] + "/TEMPLATE" + "/data/" + f"values.bin"
+        test_sys.workload.extras = [vals_path]
+        test_sys.workload.extras_addrs = [0x80C00000]
 
     if args.script is not None:
         test_sys.readfile = args.script
